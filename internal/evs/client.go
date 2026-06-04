@@ -9,6 +9,8 @@ import (
 
 	golangsdk "github.com/opentelekomcloud/gophertelekomcloud"
 	"github.com/opentelekomcloud/gophertelekomcloud/openstack"
+
+	"wilaris.dev/t-cloud-public-csi-drive/internal/log"
 )
 
 const (
@@ -155,5 +157,6 @@ func sanitizeError(err error, cfg Config) error {
 	if cfg.SecurityToken != "" {
 		msg = strings.ReplaceAll(msg, cfg.SecurityToken, "[REDACTED]")
 	}
+	msg = log.RedactString(msg)
 	return fmt.Errorf("%s", msg)
 }
