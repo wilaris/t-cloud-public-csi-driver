@@ -32,6 +32,8 @@ type EVSClient interface {
 	GetVolume(ctx context.Context, id string) (*evs.Volume, error)
 	ListVolumes(ctx context.Context, opts evs.ListVolumeOpts) ([]evs.Volume, error)
 	DeleteVolume(ctx context.Context, id string) error
+	AttachVolume(ctx context.Context, volumeID, serverID string) error
+	DetachVolume(ctx context.Context, volumeID, serverID string) error
 }
 
 // ControllerService implements the csi.ControllerServer interface.
@@ -70,8 +72,76 @@ func (s *ControllerService) ControllerGetCapabilities(
 					},
 				},
 			},
+			{
+				Type: &csi.ControllerServiceCapability_Rpc{
+					Rpc: &csi.ControllerServiceCapability_RPC{
+						Type: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
+					},
+				},
+			},
 		},
 	}, nil
+}
+
+// ControllerPublishVolume attaches an EVS volume to the specified compute instance (node_id).
+func (s *ControllerService) ControllerPublishVolume(
+	ctx context.Context,
+	req *csi.ControllerPublishVolumeRequest,
+) (*csi.ControllerPublishVolumeResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
+	}
+	if strings.TrimSpace(req.GetVolumeId()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id cannot be empty")
+	}
+	if strings.TrimSpace(req.GetNodeId()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_id cannot be empty")
+	}
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume_capability cannot be nil")
+	}
+
+	if err := validateVolumeCapability(req.GetVolumeCapability()); err != nil {
+		return nil, err
+	}
+
+	err := s.evsClient.AttachVolume(ctx, req.GetVolumeId(), req.GetNodeId())
+	if err != nil {
+		return nil, toGRPCError(
+			fmt.Sprintf("publish volume %q to node %q", req.GetVolumeId(), req.GetNodeId()),
+			err,
+		)
+	}
+
+	return &csi.ControllerPublishVolumeResponse{
+		PublishContext: map[string]string{},
+	}, nil
+}
+
+// ControllerUnpublishVolume detaches an EVS volume from the specified compute instance (node_id).
+func (s *ControllerService) ControllerUnpublishVolume(
+	ctx context.Context,
+	req *csi.ControllerUnpublishVolumeRequest,
+) (*csi.ControllerUnpublishVolumeResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
+	}
+	if strings.TrimSpace(req.GetVolumeId()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume_id cannot be empty")
+	}
+	if strings.TrimSpace(req.GetNodeId()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_id cannot be empty")
+	}
+
+	err := s.evsClient.DetachVolume(ctx, req.GetVolumeId(), req.GetNodeId())
+	if err != nil {
+		return nil, toGRPCError(
+			fmt.Sprintf("unpublish volume %q from node %q", req.GetVolumeId(), req.GetNodeId()),
+			err,
+		)
+	}
+
+	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
 // CreateVolume provisions a new volume or returns an existing compatible volume (idempotent).
