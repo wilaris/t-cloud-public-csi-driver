@@ -50,10 +50,11 @@ type ListVolumeOpts struct {
 
 // Client manages EVS volume lifecycle operations.
 type Client struct {
-	cfg      Config
-	provider *golangsdk.ProviderClient
-	v3Client *golangsdk.ServiceClient
-	v2Client *golangsdk.ServiceClient
+	cfg       Config
+	provider  *golangsdk.ProviderClient
+	v3Client  *golangsdk.ServiceClient
+	v2Client  *golangsdk.ServiceClient
+	ecsClient *golangsdk.ServiceClient
 }
 
 // NewClient constructs a Client from a validated Config.
@@ -87,36 +88,57 @@ func NewClientFromProvider(provider *golangsdk.ProviderClient, cfg Config) (*Cli
 		)
 	}
 
+	ecsClient, err := openstack.NewComputeV1(provider, golangsdk.EndpointOpts{
+		Region: cfg.RegionName,
+	})
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to create ECS v1 service client: %w",
+			sanitizeError(err, cfg),
+		)
+	}
+
 	return &Client{
-		cfg:      cfg,
-		provider: provider,
-		v3Client: v3Client,
-		v2Client: v2Client,
+		cfg:       cfg,
+		provider:  provider,
+		v3Client:  v3Client,
+		v2Client:  v2Client,
+		ecsClient: ecsClient,
 	}, nil
 }
 
 // NewClientWithServiceClients constructs a Client with explicit service clients (for testing).
-func NewClientWithServiceClients(v3Client, v2Client *golangsdk.ServiceClient, cfg Config) *Client {
+func NewClientWithServiceClients(
+	v3Client, v2Client, ecsClient *golangsdk.ServiceClient,
+	cfg Config,
+) *Client {
 	return &Client{
-		cfg:      cfg,
-		v3Client: v3Client,
-		v2Client: v2Client,
+		cfg:       cfg,
+		v3Client:  v3Client,
+		v2Client:  v2Client,
+		ecsClient: ecsClient,
 	}
 }
 
 // CreateVolume creates a new EVS volume and polls job status until complete or context is cancelled.
 func (c *Client) CreateVolume(ctx context.Context, opts CreateVolumeOpts) (*Volume, error) {
 	if ctx.Err() != nil {
-		return nil, sanitizeError(ctx.Err(), c.cfg)
+		return nil, c.classifyError("create volume", ctx.Err())
 	}
 	if strings.TrimSpace(opts.AvailabilityZone) == "" {
-		return nil, fmt.Errorf("availability_zone is required")
+		return nil, fmt.Errorf(
+			"create volume: availability_zone is required: %w",
+			ErrInvalidArgument,
+		)
 	}
 	if strings.TrimSpace(opts.VolumeType) == "" {
-		return nil, fmt.Errorf("volume_type is required")
+		return nil, fmt.Errorf("create volume: volume_type is required: %w", ErrInvalidArgument)
 	}
 	if opts.Size <= 0 {
-		return nil, fmt.Errorf("volume size must be greater than 0")
+		return nil, fmt.Errorf(
+			"create volume: volume size must be greater than 0: %w",
+			ErrInvalidArgument,
+		)
 	}
 
 	createOpts := v3volumes.CreateOpts{
@@ -132,28 +154,31 @@ func (c *Client) CreateVolume(ctx context.Context, opts CreateVolumeOpts) (*Volu
 
 	res := v3volumes.Create(c.v3Client, createOpts)
 	if res.Err != nil {
-		return nil, sanitizeError(res.Err, c.cfg)
+		return nil, c.classifyError("create volume", res.Err)
 	}
 
 	jobResp, err := res.ExtractJobResponse()
 	if err != nil {
-		return nil, sanitizeError(err, c.cfg)
+		return nil, c.classifyError("create volume", err)
 	}
 	if jobResp.JobID == "" {
-		return nil, fmt.Errorf("EVS volume creation response missing job_id")
+		return nil, fmt.Errorf("create volume: response missing job_id: %w", ErrOperationFailed)
 	}
 
 	if err := c.waitForJobSuccess(ctx, jobResp.JobID); err != nil {
-		return nil, sanitizeError(err, c.cfg)
+		return nil, c.classifyError("create volume: wait for job", err)
 	}
 
 	volIDInterface, err := v3volumes.GetJobEntity(c.v3Client, jobResp.JobID, "volume_id")
 	if err != nil {
-		return nil, sanitizeError(err, c.cfg)
+		return nil, c.classifyError("create volume: get job entity", err)
 	}
 	volID, ok := volIDInterface.(string)
 	if !ok || volID == "" {
-		return nil, fmt.Errorf("job entity did not return a valid volume_id string")
+		return nil, fmt.Errorf(
+			"create volume: job entity did not return a valid volume_id: %w",
+			ErrOperationFailed,
+		)
 	}
 
 	return c.GetVolume(ctx, volID)
@@ -162,16 +187,16 @@ func (c *Client) CreateVolume(ctx context.Context, opts CreateVolumeOpts) (*Volu
 // GetVolume retrieves an EVS volume by ID.
 func (c *Client) GetVolume(ctx context.Context, id string) (*Volume, error) {
 	if ctx.Err() != nil {
-		return nil, sanitizeError(ctx.Err(), c.cfg)
+		return nil, c.classifyError("get volume", ctx.Err())
 	}
 	if strings.TrimSpace(id) == "" {
-		return nil, fmt.Errorf("volume id cannot be empty")
+		return nil, fmt.Errorf("get volume: volume id cannot be empty: %w", ErrInvalidArgument)
 	}
 
 	res := v3volumes.Get(c.v3Client, id)
 	v3Vol, err := res.Extract()
 	if err != nil {
-		return nil, sanitizeError(err, c.cfg)
+		return nil, c.classifyError(fmt.Sprintf("get volume %s", id), err)
 	}
 
 	return mapV3VolumeToDomain(v3Vol), nil
@@ -180,7 +205,7 @@ func (c *Client) GetVolume(ctx context.Context, id string) (*Volume, error) {
 // ListVolumes lists EVS volumes matching the given criteria.
 func (c *Client) ListVolumes(ctx context.Context, opts ListVolumeOpts) ([]Volume, error) {
 	if ctx.Err() != nil {
-		return nil, sanitizeError(ctx.Err(), c.cfg)
+		return nil, c.classifyError("list volumes", ctx.Err())
 	}
 
 	listOpts := cloudvolumes.ListOpts{
@@ -194,7 +219,7 @@ func (c *Client) ListVolumes(ctx context.Context, opts ListVolumeOpts) ([]Volume
 
 	v2Vols, err := cloudvolumes.List(c.v2Client, listOpts)
 	if err != nil {
-		return nil, sanitizeError(err, c.cfg)
+		return nil, c.classifyError("list volumes", err)
 	}
 
 	res := make([]Volume, len(v2Vols))
@@ -207,15 +232,15 @@ func (c *Client) ListVolumes(ctx context.Context, opts ListVolumeOpts) ([]Volume
 // DeleteVolume deletes an EVS volume by ID.
 func (c *Client) DeleteVolume(ctx context.Context, id string) error {
 	if ctx.Err() != nil {
-		return sanitizeError(ctx.Err(), c.cfg)
+		return c.classifyError("delete volume", ctx.Err())
 	}
 	if strings.TrimSpace(id) == "" {
-		return fmt.Errorf("volume id cannot be empty")
+		return fmt.Errorf("delete volume: volume id cannot be empty: %w", ErrInvalidArgument)
 	}
 
 	res := blockstoragev3.Delete(c.v3Client, id)
 	if res.Err != nil {
-		return sanitizeError(res.Err, c.cfg)
+		return c.classifyError(fmt.Sprintf("delete volume %s", id), res.Err)
 	}
 
 	return nil
@@ -263,6 +288,7 @@ func (c *Client) waitForJobSuccess(ctx context.Context, jobID string) error {
 	}
 }
 
+// mapV3VolumeToDomain maps an OpenStack BlockStorage v3 volume struct to a domain Volume.
 func mapV3VolumeToDomain(v *v3volumes.Volume) *Volume {
 	if v == nil {
 		return nil
@@ -288,6 +314,7 @@ func mapV3VolumeToDomain(v *v3volumes.Volume) *Volume {
 	}
 }
 
+// mapV2VolumeToDomain maps an OpenStack CloudVolume v2 struct to a domain Volume.
 func mapV2VolumeToDomain(v *cloudvolumes.Volume) Volume {
 	metadata := make(map[string]string)
 	if v.Metadata.SystemCmkID != "" {

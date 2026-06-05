@@ -2,7 +2,10 @@
 package evs
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -20,6 +23,24 @@ const (
 	EnvProjectID     = "OS_PROJECT_ID"
 	EnvRegionName    = "OS_REGION_NAME"
 	EnvSecurityToken = "OS_SECURITY_TOKEN" //nolint:gosec // environment variable name constant
+)
+
+// Package-level error definitions for domain-level EVS operation classification.
+var (
+	// ErrNotFound indicates the target cloud resource was not found.
+	ErrNotFound = errors.New("cloud resource not found")
+	// ErrConflict indicates a state conflict during a cloud operation.
+	ErrConflict = errors.New("cloud operation conflict")
+	// ErrInvalidArgument indicates invalid or rejected operation inputs.
+	ErrInvalidArgument = errors.New("cloud rejected input")
+	// ErrUnauthenticated indicates authentication failure with the cloud service.
+	ErrUnauthenticated = errors.New("cloud authentication failed")
+	// ErrPermissionDenied indicates authorization failure for the requested operation.
+	ErrPermissionDenied = errors.New("cloud authorization failed")
+	// ErrUnavailable indicates a transient or temporary cloud service unavailability.
+	ErrUnavailable = errors.New("cloud service unavailable")
+	// ErrOperationFailed indicates a non-transient error or unexpected failure in cloud operations.
+	ErrOperationFailed = errors.New("cloud operation failed")
 )
 
 // Config holds validated AK/SK authentication credentials and target cloud settings.
@@ -159,4 +180,69 @@ func sanitizeError(err error, cfg Config) error {
 	}
 	msg = log.RedactString(msg)
 	return fmt.Errorf("%s", msg)
+}
+
+// classifyError wraps an operation error with a domain sentinel error and redacts sensitive data.
+func (c *Client) classifyError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+
+	kind := classifyErrorKind(err)
+	safeErr := sanitizeError(err, c.cfg)
+	return fmt.Errorf("%s: %w: %s", operation, kind, safeErr)
+}
+
+// classifyErrorKind maps SDK and system errors to package sentinel error categories.
+func classifyErrorKind(err error) error {
+	var (
+		badRequest     golangsdk.ErrDefault400
+		unauthorized   golangsdk.ErrDefault401
+		forbidden      golangsdk.ErrDefault403
+		notFound       golangsdk.ErrDefault404
+		requestTimeout golangsdk.ErrDefault408
+		conflict       golangsdk.ErrDefault409
+		tooMany        golangsdk.ErrDefault429
+		serverError    golangsdk.ErrDefault500
+		unavailable    golangsdk.ErrDefault503
+		responseError  golangsdk.ErrUnexpectedResponseCode
+		networkError   net.Error
+	)
+
+	switch {
+	case errors.Is(err, ErrNotFound),
+		errors.Is(err, ErrConflict),
+		errors.Is(err, ErrInvalidArgument),
+		errors.Is(err, ErrUnauthenticated),
+		errors.Is(err, ErrPermissionDenied),
+		errors.Is(err, ErrUnavailable),
+		errors.Is(err, ErrOperationFailed):
+		return err
+	case errors.As(err, &badRequest):
+		return ErrInvalidArgument
+	case errors.As(err, &unauthorized):
+		return ErrUnauthenticated
+	case errors.As(err, &forbidden):
+		return ErrPermissionDenied
+	case errors.As(err, &notFound):
+		return ErrNotFound
+	case errors.As(err, &conflict):
+		return ErrConflict
+	case errors.As(err, &requestTimeout),
+		errors.As(err, &tooMany),
+		errors.As(err, &serverError),
+		errors.As(err, &unavailable),
+		errors.As(err, &networkError):
+		return ErrUnavailable
+	case errors.As(err, &responseError):
+		if responseError.Actual == http.StatusBadGateway ||
+			responseError.Actual == http.StatusGatewayTimeout {
+			return ErrUnavailable
+		}
+	}
+
+	return ErrOperationFailed
 }
