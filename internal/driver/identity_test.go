@@ -1,0 +1,295 @@
+package driver_test
+
+import (
+	"context"
+	"net"
+	"strings"
+	"testing"
+
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
+
+	"wilaris.dev/t-cloud-public-csi-drive/internal/config"
+	"wilaris.dev/t-cloud-public-csi-drive/internal/driver"
+)
+
+const bufSize = 1024 * 1024
+
+func validTestConfig() *config.Config {
+	return &config.Config{
+		Endpoint:   "unix:///tmp/csi.sock",
+		NodeID:     "12345678-1234-1234-1234-123456789012",
+		DriverName: "evs.csi.t-cloud.ti-services.io",
+		Version:    "v0.1.0",
+		AuthURL:    "https://iam.example.com/v3",
+		AccessKey:  "test-ak",
+		SecretKey:  "test-sk",
+		ProjectID:  "test-project-id",
+		RegionName: "eu-de",
+	}
+}
+
+func TestNewIdentityService_Validation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		cfg     *config.Config
+		wantErr bool
+	}{
+		{
+			name:    "nil config",
+			cfg:     nil,
+			wantErr: true,
+		},
+		{
+			name: "empty driver name",
+			cfg: &config.Config{
+				DriverName: "",
+				Version:    "v0.1.0",
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty version",
+			cfg: &config.Config{
+				DriverName: "evs.csi.t-cloud.ti-services.io",
+				Version:    "",
+			},
+			wantErr: true,
+		},
+		{
+			name:    "valid config",
+			cfg:     validTestConfig(),
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			svc, err := driver.NewIdentityService(tt.cfg)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("NewIdentityService() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && svc == nil {
+				t.Fatal("expected non-nil IdentityService")
+			}
+		})
+	}
+}
+
+func setupGRPCIdentityServer(
+	t *testing.T,
+	svc *driver.IdentityService,
+) (csi.IdentityClient, func()) {
+	t.Helper()
+
+	ln := bufconn.Listen(bufSize)
+	server := grpc.NewServer()
+	csi.RegisterIdentityServer(server, svc)
+
+	go func() {
+		if err := server.Serve(ln); err != nil && err != grpc.ErrServerStopped {
+			t.Errorf("gRPC server error: %v", err)
+		}
+	}()
+
+	bufDialer := func(context.Context, string) (net.Conn, error) {
+		return ln.Dial()
+	}
+
+	conn, err := grpc.NewClient(
+		"passthrough://bufnet",
+		grpc.WithContextDialer(bufDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial bufnet: %v", err)
+	}
+
+	client := csi.NewIdentityClient(conn)
+
+	cleanup := func() {
+		_ = conn.Close()
+		server.GracefulStop()
+		_ = ln.Close()
+	}
+
+	return client, cleanup
+}
+
+func TestIdentityService_GRPC_GetPluginInfo(t *testing.T) {
+	t.Parallel()
+
+	cfg := validTestConfig()
+	svc, err := driver.NewIdentityService(cfg)
+	if err != nil {
+		t.Fatalf("NewIdentityService failed: %v", err)
+	}
+
+	client, cleanup := setupGRPCIdentityServer(t, svc)
+	defer cleanup()
+
+	res, err := client.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
+	if err != nil {
+		t.Fatalf("GetPluginInfo failed: %v", err)
+	}
+
+	if res.GetName() != cfg.DriverName {
+		t.Errorf("expected driver name %q, got %q", cfg.DriverName, res.GetName())
+	}
+	if res.GetVendorVersion() != cfg.Version {
+		t.Errorf("expected version %q, got %q", cfg.Version, res.GetVendorVersion())
+	}
+}
+
+func TestIdentityService_GRPC_GetPluginCapabilities(t *testing.T) {
+	t.Parallel()
+
+	cfg := validTestConfig()
+	svc, err := driver.NewIdentityService(cfg)
+	if err != nil {
+		t.Fatalf("NewIdentityService failed: %v", err)
+	}
+
+	client, cleanup := setupGRPCIdentityServer(t, svc)
+	defer cleanup()
+
+	res, err := client.GetPluginCapabilities(
+		context.Background(),
+		&csi.GetPluginCapabilitiesRequest{},
+	)
+	if err != nil {
+		t.Fatalf("GetPluginCapabilities failed: %v", err)
+	}
+
+	caps := res.GetCapabilities()
+	if len(caps) != 1 {
+		t.Fatalf("expected 1 capability, got %d", len(caps))
+	}
+
+	serviceCap := caps[0].GetService()
+	if serviceCap == nil {
+		t.Fatal("expected service capability")
+	}
+
+	if serviceCap.GetType() != csi.PluginCapability_Service_CONTROLLER_SERVICE {
+		t.Errorf(
+			"expected CONTROLLER_SERVICE capability type, got %v",
+			serviceCap.GetType(),
+		)
+	}
+}
+
+func TestIdentityService_GRPC_Probe(t *testing.T) {
+	t.Parallel()
+
+	cfg := validTestConfig()
+	svc, err := driver.NewIdentityService(cfg)
+	if err != nil {
+		t.Fatalf("NewIdentityService failed: %v", err)
+	}
+
+	client, cleanup := setupGRPCIdentityServer(t, svc)
+	defer cleanup()
+
+	res, err := client.Probe(context.Background(), &csi.ProbeRequest{})
+	if err != nil {
+		t.Fatalf("Probe failed: %v", err)
+	}
+
+	if res.GetReady() == nil || !res.GetReady().GetValue() {
+		t.Errorf("expected Probe response Ready to be true, got %v", res.GetReady())
+	}
+}
+
+func TestIdentityService_Direct_GetPluginInfo_InvalidState(t *testing.T) {
+	t.Parallel()
+
+	svc := &driver.IdentityService{}
+	_, err := svc.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
+	if err == nil {
+		t.Fatal("expected error for uninitialized IdentityService")
+	}
+
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected gRPC status error, got %v", err)
+	}
+	if st.Code() != codes.InvalidArgument {
+		t.Errorf("expected status code InvalidArgument, got %v", st.Code())
+	}
+}
+
+func TestIdentityService_GRPC_StatusMapping_Uninitialized(t *testing.T) {
+	t.Parallel()
+
+	client, cleanup := setupGRPCIdentityServer(t, &driver.IdentityService{})
+	defer cleanup()
+
+	_, err := client.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
+	if err == nil {
+		t.Fatal("expected gRPC error for uninitialized IdentityService over wire")
+	}
+
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected status error, got %v", err)
+	}
+	if st.Code() != codes.InvalidArgument {
+		t.Errorf("expected status code InvalidArgument over gRPC transport, got %v", st.Code())
+	}
+}
+
+func TestIdentityService_GRPC_CSISpecCompliance(t *testing.T) {
+	t.Parallel()
+
+	cfg := validTestConfig()
+	svc, err := driver.NewIdentityService(cfg)
+	if err != nil {
+		t.Fatalf("NewIdentityService failed: %v", err)
+	}
+
+	client, cleanup := setupGRPCIdentityServer(t, svc)
+	defer cleanup()
+
+	info, err := client.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
+	if err != nil {
+		t.Fatalf("GetPluginInfo failed: %v", err)
+	}
+
+	name := info.GetName()
+	if name == "" {
+		t.Fatal("CSI spec requirement violation: plugin name must not be empty")
+	}
+	if len(name) > 63 {
+		t.Errorf(
+			"CSI spec requirement violation: plugin name %q exceeds maximum length of 63 characters (%d)",
+			name,
+			len(name),
+		)
+	}
+	if !strings.Contains(name, ".") {
+		t.Errorf(
+			"CSI spec requirement violation: plugin name %q must follow reverse domain name notation",
+			name,
+		)
+	}
+
+	if info.GetVendorVersion() == "" {
+		t.Fatal("CSI spec requirement violation: vendor_version must not be empty")
+	}
+
+	probeRes, err := client.Probe(context.Background(), &csi.ProbeRequest{})
+	if err != nil {
+		t.Fatalf("Probe failed: %v", err)
+	}
+	if probeRes.GetReady() == nil || !probeRes.GetReady().GetValue() {
+		t.Errorf("CSI spec requirement violation: Probe response ready field must be true")
+	}
+}
