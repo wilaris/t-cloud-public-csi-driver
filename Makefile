@@ -10,7 +10,7 @@ BIN_DIR ?= bin
 DIST_DIR ?= dist
 
 # Go formatting settings
-GOIMPORTS_FLAGS ?= -local wilaris.dev/t-cloud-public-csi-drive
+GOIMPORTS_FLAGS ?= -local wilaris.dev/t-cloud-public-csi-driver
 GOLINES_FLAGS ?= --base-formatter=gofmt
 GO_SOURCES := $(shell find . -name '*.go' \
 	-not -name '*.pb.go' \

@@ -13,8 +13,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
-	"wilaris.dev/t-cloud-public-csi-drive/internal/config"
-	"wilaris.dev/t-cloud-public-csi-drive/internal/driver"
+	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
+	"wilaris.dev/t-cloud-public-csi-driver/internal/driver"
 )
 
 const bufSize = 1024 * 1024

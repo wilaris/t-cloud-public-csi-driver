@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"wilaris.dev/t-cloud-public-csi-drive/internal/evs"
+	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
 func TestLoadConfig_ValidEnv(t *testing.T) {

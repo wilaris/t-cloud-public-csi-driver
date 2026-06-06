@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"wilaris.dev/t-cloud-public-csi-drive/internal/log"
+	"wilaris.dev/t-cloud-public-csi-driver/internal/log"
 )
 
 type sampleAuthConfig struct {
