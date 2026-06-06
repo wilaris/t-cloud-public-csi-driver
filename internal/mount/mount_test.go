@@ -269,7 +269,10 @@ func TestMount(t *testing.T) {
 		t.Fatalf("expected idempotent Mount success, got: %v", err)
 	}
 	if len(fakeMounter.MountPoints) != 1 {
-		t.Errorf("expected target to stay mounted once, got %d mounts", len(fakeMounter.MountPoints))
+		t.Errorf(
+			"expected target to stay mounted once, got %d mounts",
+			len(fakeMounter.MountPoints),
+		)
 	}
 
 	// A cancelled context is refused before touching the host.
