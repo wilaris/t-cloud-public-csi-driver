@@ -21,15 +21,16 @@ const bufSize = 1024 * 1024
 
 func validTestConfig() *config.Config {
 	return &config.Config{
-		Endpoint:   "unix:///tmp/csi.sock",
-		NodeID:     "12345678-1234-1234-1234-123456789012",
-		DriverName: "evs.csi.t-cloud.ti-services.io",
-		Version:    "v0.1.0",
-		AuthURL:    "https://iam.example.com/v3",
-		AccessKey:  "test-ak",
-		SecretKey:  "test-sk",
-		ProjectID:  "test-project-id",
-		RegionName: "eu-de",
+		Endpoint:         "unix:///tmp/csi.sock",
+		NodeID:           "12345678-1234-1234-1234-123456789012",
+		DriverName:       "evs.csi.t-cloud.wilaris.dev",
+		Version:          "v0.1.0",
+		AvailabilityZone: "eu-de-01",
+		AuthURL:          "https://iam.example.com/v3",
+		AccessKey:        "test-ak",
+		SecretKey:        "test-sk",
+		ProjectID:        "test-project-id",
+		RegionName:       "eu-de",
 	}
 }
 
@@ -57,7 +58,7 @@ func TestNewIdentityService_Validation(t *testing.T) {
 		{
 			name: "empty version",
 			cfg: &config.Config{
-				DriverName: "evs.csi.t-cloud.ti-services.io",
+				DriverName: "evs.csi.t-cloud.wilaris.dev",
 				Version:    "",
 			},
 			wantErr: true,

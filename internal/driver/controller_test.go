@@ -124,7 +124,7 @@ func testConfig() *config.Config {
 	return &config.Config{
 		Endpoint:   "unix:///tmp/test.sock",
 		NodeID:     "node-1",
-		DriverName: "evs.csi.t-cloud.ti-services.io",
+		DriverName: "evs.csi.t-cloud.wilaris.dev",
 		Version:    "v0.1.0",
 		AuthURL:    "https://iam.example.com/v3",
 		AccessKey:  "ak",

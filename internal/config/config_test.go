@@ -34,6 +34,7 @@ func TestParseSuccess(t *testing.T) {
 		"--endpoint", "unix:///tmp/csi.sock",
 		"--driver-name", "my-custom-driver",
 		"--version", "v1.2.3",
+		"--availability-zone", "eu-de-01",
 	}
 
 	cfg, err := config.Parse(args, mockGetenv(env))
@@ -46,6 +47,9 @@ func TestParseSuccess(t *testing.T) {
 	}
 	if cfg.Endpoint != "unix:///tmp/csi.sock" {
 		t.Errorf("expected Endpoint %q, got %q", "unix:///tmp/csi.sock", cfg.Endpoint)
+	}
+	if cfg.AvailabilityZone != "eu-de-01" {
+		t.Errorf("expected AvailabilityZone %q, got %q", "eu-de-01", cfg.AvailabilityZone)
 	}
 	if cfg.DriverName != "my-custom-driver" {
 		t.Errorf("expected DriverName %q, got %q", "my-custom-driver", cfg.DriverName)

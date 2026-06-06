@@ -11,9 +11,11 @@ import (
 
 const (
 	// DefaultDriverName is the default Container Storage Interface plugin identifier.
-	DefaultDriverName = "evs.csi.t-cloud.ti-services.io"
-	// DefaultEndpoint is the default unix domain socket path for gRPC.
-	DefaultEndpoint = "unix:///var/lib/kubelet/plugins/evs.csi.t-cloud.ti-services.io/csi.sock"
+	DefaultDriverName = "evs.csi.t-cloud.wilaris.dev"
+	// DefaultEndpoint is the default unix domain socket path for gRPC. The directory segment
+	// must match DefaultDriverName, because kubelet derives the plugin socket directory from
+	// the name the driver registers under.
+	DefaultEndpoint = "unix:///var/lib/kubelet/plugins/evs.csi.t-cloud.wilaris.dev/csi.sock"
 	// DefaultVersion is the default driver release version.
 	DefaultVersion = "v0.1.0"
 
@@ -48,6 +50,10 @@ type Config struct {
 	NodeID     string
 	DriverName string
 	Version    string
+	// AvailabilityZone is the EVS availability zone of this node. It is required by the
+	// Node service, which reports it as the node's zone topology, and unused by the
+	// Controller service, which takes the zone from each request instead.
+	AvailabilityZone string
 
 	// Authentication Environment Variables
 	AuthURL       string
@@ -61,11 +67,12 @@ type Config struct {
 // String implements fmt.Stringer to produce a safe string representation of Config without leaking credentials.
 func (c Config) String() string {
 	return fmt.Sprintf(
-		"Config{Endpoint:%q, NodeID:%q, DriverName:%q, Version:%q, AuthURL:%q, AccessKey:%s, SecretKey:%s, ProjectID:%q, RegionName:%q, SecurityToken:%s}",
+		"Config{Endpoint:%q, NodeID:%q, DriverName:%q, Version:%q, AvailabilityZone:%q, AuthURL:%q, AccessKey:%s, SecretKey:%s, ProjectID:%q, RegionName:%q, SecurityToken:%s}",
 		c.Endpoint,
 		c.NodeID,
 		c.DriverName,
 		c.Version,
+		c.AvailabilityZone,
 		c.AuthURL,
 		c.AccessKey,
 		c.SecretKey,
@@ -89,10 +96,11 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 	fs := flag.NewFlagSet("t-cloud-csi-driver", flag.ContinueOnError)
 
 	var (
-		endpoint   string
-		nodeID     string
-		driverName string
-		version    string
+		endpoint         string
+		nodeID           string
+		driverName       string
+		version          string
+		availabilityZone string
 	)
 
 	fs.StringVar(
@@ -104,16 +112,24 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 	fs.StringVar(&nodeID, "nodeid", "", "T Cloud Public compute instance Server UUID (required)")
 	fs.StringVar(&driverName, "driver-name", DefaultDriverName, "CSI driver name")
 	fs.StringVar(&version, "version", DefaultVersion, "CSI driver version")
+	fs.StringVar(
+		&availabilityZone,
+		"availability-zone",
+		"",
+		"T Cloud Public availability zone of this node (required by the node service)",
+	)
 
 	if err := fs.Parse(args); err != nil {
 		return nil, fmt.Errorf("failed to parse CLI flags: %w", err)
 	}
 
 	cfg := &Config{
-		Endpoint:      strings.TrimSpace(endpoint),
-		NodeID:        strings.TrimSpace(nodeID),
-		DriverName:    strings.TrimSpace(driverName),
-		Version:       strings.TrimSpace(version),
+		Endpoint:         strings.TrimSpace(endpoint),
+		NodeID:           strings.TrimSpace(nodeID),
+		DriverName:       strings.TrimSpace(driverName),
+		Version:          strings.TrimSpace(version),
+		AvailabilityZone: strings.TrimSpace(availabilityZone),
+
 		AuthURL:       strings.TrimSpace(getenv(EnvAuthURL)),
 		AccessKey:     SecretString(strings.TrimSpace(getenv(EnvAccessKey))),
 		SecretKey:     SecretString(strings.TrimSpace(getenv(EnvSecretKey))),
