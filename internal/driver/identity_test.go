@@ -107,20 +107,30 @@ func TestIdentityService_GRPC_GetPluginCapabilities(t *testing.T) {
 	}
 
 	caps := res.GetCapabilities()
-	if len(caps) != 1 {
-		t.Fatalf("expected 1 capability, got %d", len(caps))
+	if len(caps) != 2 {
+		t.Fatalf("expected 2 capabilities, got %d", len(caps))
 	}
 
-	serviceCap := caps[0].GetService()
-	if serviceCap == nil {
-		t.Fatal("expected service capability")
+	want := map[csi.PluginCapability_Service_Type]bool{
+		csi.PluginCapability_Service_CONTROLLER_SERVICE:               false,
+		csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS: false,
 	}
-
-	if serviceCap.GetType() != csi.PluginCapability_Service_CONTROLLER_SERVICE {
-		t.Errorf(
-			"expected CONTROLLER_SERVICE capability type, got %v",
-			serviceCap.GetType(),
-		)
+	for _, capability := range caps {
+		serviceCapability := capability.GetService()
+		if serviceCapability == nil {
+			t.Fatal("expected service capability")
+		}
+		capabilityType := serviceCapability.GetType()
+		if _, ok := want[capabilityType]; !ok {
+			t.Errorf("unexpected service capability %v", capabilityType)
+			continue
+		}
+		want[capabilityType] = true
+	}
+	for capabilityType, found := range want {
+		if !found {
+			t.Errorf("expected service capability %v", capabilityType)
+		}
 	}
 }
 

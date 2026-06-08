@@ -407,6 +407,84 @@ func TestCreateVolume_HappyPath(t *testing.T) {
 	}
 }
 
+func TestCreateVolume_TopologyRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	cfg := validTestConfig()
+	identityService, err := driver.NewIdentityService(cfg)
+	if err != nil {
+		t.Fatalf("NewIdentityService failed: %v", err)
+	}
+	nodeService, err := driver.NewNodeService(&fakeMounter{}, cfg)
+	if err != nil {
+		t.Fatalf("NewNodeService failed: %v", err)
+	}
+	evsClient := newMockEVSClient()
+	controllerService, err := driver.NewControllerService(evsClient, cfg)
+	if err != nil {
+		t.Fatalf("NewControllerService failed: %v", err)
+	}
+
+	conn := serveCSI(t, func(server *grpc.Server) {
+		csi.RegisterIdentityServer(server, identityService)
+		csi.RegisterNodeServer(server, nodeService)
+		csi.RegisterControllerServer(server, controllerService)
+	})
+
+	identityClient := csi.NewIdentityClient(conn)
+	capabilities, err := identityClient.GetPluginCapabilities(
+		context.Background(),
+		&csi.GetPluginCapabilitiesRequest{},
+	)
+	if err != nil {
+		t.Fatalf("GetPluginCapabilities failed: %v", err)
+	}
+	topologySupported := false
+	for _, capability := range capabilities.GetCapabilities() {
+		if capability.GetService().GetType() ==
+			csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS {
+			topologySupported = true
+			break
+		}
+	}
+	if !topologySupported {
+		t.Fatal("VOLUME_ACCESSIBILITY_CONSTRAINTS is not advertised")
+	}
+
+	nodeClient := csi.NewNodeClient(conn)
+	nodeInfo, err := nodeClient.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
+	if err != nil {
+		t.Fatalf("NodeGetInfo failed: %v", err)
+	}
+	nodeTopology := nodeInfo.GetAccessibleTopology()
+	if nodeTopology == nil {
+		t.Fatal("NodeGetInfo did not return accessible topology")
+	}
+
+	controllerClient := csi.NewControllerClient(conn)
+	created, err := controllerClient.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name: "topology-round-trip",
+		VolumeCapabilities: []*csi.VolumeCapability{
+			mountCapability(""),
+		},
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{nodeTopology},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume failed: %v", err)
+	}
+
+	accessibleTopology := created.GetVolume().GetAccessibleTopology()
+	if len(accessibleTopology) != 1 {
+		t.Fatalf("expected one accessible topology, got %d", len(accessibleTopology))
+	}
+	createdZone := accessibleTopology[0].GetSegments()[driver.TopologyZoneKey]
+	if createdZone != cfg.AvailabilityZone {
+		t.Errorf("expected created volume zone %q, got %q", cfg.AvailabilityZone, createdZone)
+	}
+}
+
 func TestCreateVolume_Idempotency(t *testing.T) {
 	t.Parallel()
 
