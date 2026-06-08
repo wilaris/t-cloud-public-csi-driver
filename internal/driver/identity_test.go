@@ -2,37 +2,16 @@ package driver_test
 
 import (
 	"context"
-	"net"
 	"strings"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/test/bufconn"
 
 	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
 	"wilaris.dev/t-cloud-public-csi-driver/internal/driver"
 )
-
-const bufSize = 1024 * 1024
-
-func validTestConfig() *config.Config {
-	return &config.Config{
-		Endpoint:         "unix:///tmp/csi.sock",
-		NodeID:           "12345678-1234-1234-1234-123456789012",
-		DriverName:       "evs.csi.t-cloud.wilaris.dev",
-		Version:          "v0.1.0",
-		AvailabilityZone: "eu-de-01",
-		AuthURL:          "https://iam.example.com/v3",
-		AccessKey:        "test-ak",
-		SecretKey:        "test-sk",
-		ProjectID:        "test-project-id",
-		RegionName:       "eu-de",
-	}
-}
 
 func TestNewIdentityService_Validation(t *testing.T) {
 	t.Parallel()
@@ -84,46 +63,6 @@ func TestNewIdentityService_Validation(t *testing.T) {
 	}
 }
 
-func setupGRPCIdentityServer(
-	t *testing.T,
-	svc *driver.IdentityService,
-) (csi.IdentityClient, func()) {
-	t.Helper()
-
-	ln := bufconn.Listen(bufSize)
-	server := grpc.NewServer()
-	csi.RegisterIdentityServer(server, svc)
-
-	go func() {
-		if err := server.Serve(ln); err != nil && err != grpc.ErrServerStopped {
-			t.Errorf("gRPC server error: %v", err)
-		}
-	}()
-
-	bufDialer := func(context.Context, string) (net.Conn, error) {
-		return ln.Dial()
-	}
-
-	conn, err := grpc.NewClient(
-		"passthrough://bufnet",
-		grpc.WithContextDialer(bufDialer),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("failed to dial bufnet: %v", err)
-	}
-
-	client := csi.NewIdentityClient(conn)
-
-	cleanup := func() {
-		_ = conn.Close()
-		server.GracefulStop()
-		_ = ln.Close()
-	}
-
-	return client, cleanup
-}
-
 func TestIdentityService_GRPC_GetPluginInfo(t *testing.T) {
 	t.Parallel()
 
@@ -133,8 +72,7 @@ func TestIdentityService_GRPC_GetPluginInfo(t *testing.T) {
 		t.Fatalf("NewIdentityService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCIdentityServer(t, svc)
-	defer cleanup()
+	client := newIdentityClient(t, svc)
 
 	res, err := client.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
 	if err != nil {
@@ -158,8 +96,7 @@ func TestIdentityService_GRPC_GetPluginCapabilities(t *testing.T) {
 		t.Fatalf("NewIdentityService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCIdentityServer(t, svc)
-	defer cleanup()
+	client := newIdentityClient(t, svc)
 
 	res, err := client.GetPluginCapabilities(
 		context.Background(),
@@ -196,8 +133,7 @@ func TestIdentityService_GRPC_Probe(t *testing.T) {
 		t.Fatalf("NewIdentityService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCIdentityServer(t, svc)
-	defer cleanup()
+	client := newIdentityClient(t, svc)
 
 	res, err := client.Probe(context.Background(), &csi.ProbeRequest{})
 	if err != nil {
@@ -230,8 +166,7 @@ func TestIdentityService_Direct_GetPluginInfo_InvalidState(t *testing.T) {
 func TestIdentityService_GRPC_StatusMapping_Uninitialized(t *testing.T) {
 	t.Parallel()
 
-	client, cleanup := setupGRPCIdentityServer(t, &driver.IdentityService{})
-	defer cleanup()
+	client := newIdentityClient(t, &driver.IdentityService{})
 
 	_, err := client.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
 	if err == nil {
@@ -256,8 +191,7 @@ func TestIdentityService_GRPC_CSISpecCompliance(t *testing.T) {
 		t.Fatalf("NewIdentityService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCIdentityServer(t, svc)
-	defer cleanup()
+	client := newIdentityClient(t, svc)
 
 	info, err := client.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
 	if err != nil {

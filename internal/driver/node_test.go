@@ -3,18 +3,14 @@ package driver_test
 import (
 	"context"
 	"errors"
-	"net"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/test/bufconn"
 
 	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
 	"wilaris.dev/t-cloud-public-csi-driver/internal/driver"
@@ -86,46 +82,6 @@ func (f *fakeMounter) GetMountSource(ctx context.Context, target string) (string
 		return f.getMountSourceFn(ctx, target)
 	}
 	return "/dev/sdb", nil
-}
-
-func setupGRPCNodeServer(
-	t *testing.T,
-	svc *driver.NodeService,
-) (csi.NodeClient, func()) {
-	t.Helper()
-
-	ln := bufconn.Listen(1024 * 1024)
-	server := grpc.NewServer()
-	csi.RegisterNodeServer(server, svc)
-
-	go func() {
-		if err := server.Serve(ln); err != nil && err != grpc.ErrServerStopped {
-			t.Errorf("gRPC server error: %v", err)
-		}
-	}()
-
-	bufDialer := func(context.Context, string) (net.Conn, error) {
-		return ln.Dial()
-	}
-
-	conn, err := grpc.NewClient(
-		"passthrough://bufnet",
-		grpc.WithContextDialer(bufDialer),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("failed to dial bufnet: %v", err)
-	}
-
-	client := csi.NewNodeClient(conn)
-
-	cleanup := func() {
-		_ = conn.Close()
-		server.GracefulStop()
-		_ = ln.Close()
-	}
-
-	return client, cleanup
 }
 
 func TestNewNodeService_Validation(t *testing.T) {
@@ -201,8 +157,7 @@ func TestNodeService_NodeGetInfo(t *testing.T) {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCNodeServer(t, svc)
-	defer cleanup()
+	client := newNodeClient(t, svc)
 
 	res, err := client.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
 	if err != nil {
@@ -239,8 +194,7 @@ func TestNodeService_NodeGetCapabilities(t *testing.T) {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCNodeServer(t, svc)
-	defer cleanup()
+	client := newNodeClient(t, svc)
 
 	res, err := client.NodeGetCapabilities(
 		context.Background(),
@@ -287,20 +241,12 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCNodeServer(t, svc)
-	defer cleanup()
+	client := newNodeClient(t, svc)
 
 	// 1. Missing volume ID
 	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 		StagingTargetPath: stagingPath,
-		VolumeCapability: &csi.VolumeCapability{
-			AccessType: &csi.VolumeCapability_Mount{
-				Mount: &csi.VolumeCapability_MountVolume{},
-			},
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-			},
-		},
+		VolumeCapability:  mountCapability(""),
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Errorf("expected InvalidArgument for missing volume_id, got: %v", err)
@@ -310,14 +256,7 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-missing",
 		StagingTargetPath: stagingPath,
-		VolumeCapability: &csi.VolumeCapability{
-			AccessType: &csi.VolumeCapability_Mount{
-				Mount: &csi.VolumeCapability_MountVolume{},
-			},
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-			},
-		},
+		VolumeCapability:  mountCapability(""),
 	})
 	if status.Code(err) != codes.NotFound {
 		t.Errorf("expected NotFound for missing device, got: %v", err)
@@ -327,16 +266,7 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: stagingPath,
-		VolumeCapability: &csi.VolumeCapability{
-			AccessType: &csi.VolumeCapability_Mount{
-				Mount: &csi.VolumeCapability_MountVolume{
-					FsType: "ext4",
-				},
-			},
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-			},
-		},
+		VolumeCapability:  mountCapability("ext4"),
 	})
 	if err != nil {
 		t.Fatalf("NodeStageVolume mount mode failed: %v", err)
@@ -350,14 +280,7 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: blockStagingPath,
-		VolumeCapability: &csi.VolumeCapability{
-			AccessType: &csi.VolumeCapability_Block{
-				Block: &csi.VolumeCapability_BlockVolume{},
-			},
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-			},
-		},
+		VolumeCapability:  blockCapability(),
 	})
 	if err != nil {
 		t.Fatalf("NodeStageVolume block mode failed: %v", err)
@@ -388,8 +311,7 @@ func TestNodeService_NodeUnstageVolume(t *testing.T) {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCNodeServer(t, svc)
-	defer cleanup()
+	client := newNodeClient(t, svc)
 
 	// Missing parameters
 	_, err = client.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{})
@@ -459,8 +381,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCNodeServer(t, svc)
-	defer cleanup()
+	client := newNodeClient(t, svc)
 
 	// 1. Invalid access mode
 	_, err = client.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
@@ -485,14 +406,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 		VolumeId:          "vol-123",
 		StagingTargetPath: stagingPath,
 		TargetPath:        targetPath,
-		VolumeCapability: &csi.VolumeCapability{
-			AccessType: &csi.VolumeCapability_Mount{
-				Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"},
-			},
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-			},
-		},
+		VolumeCapability:  mountCapability("ext4"),
 	})
 	if err != nil {
 		t.Fatalf("NodePublishVolume mount mode failed: %v", err)
@@ -546,14 +460,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 		VolumeId:          "vol-123",
 		StagingTargetPath: filepath.Join(tmpDir, "unstaged"),
 		TargetPath:        filepath.Join(tmpDir, "target-unstaged"),
-		VolumeCapability: &csi.VolumeCapability{
-			AccessType: &csi.VolumeCapability_Mount{
-				Mount: &csi.VolumeCapability_MountVolume{},
-			},
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-			},
-		},
+		VolumeCapability:  mountCapability(""),
 	})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("expected FailedPrecondition for unstaged volume, got: %v", err)
@@ -569,14 +476,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 		VolumeId:          "vol-123",
 		StagingTargetPath: stagingPath,
 		TargetPath:        blockTargetPath,
-		VolumeCapability: &csi.VolumeCapability{
-			AccessType: &csi.VolumeCapability_Block{
-				Block: &csi.VolumeCapability_BlockVolume{},
-			},
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-			},
-		},
+		VolumeCapability:  blockCapability(),
 	})
 	if err != nil {
 		t.Fatalf("NodePublishVolume block mode failed: %v", err)
@@ -626,8 +526,7 @@ func TestNodeService_NodeUnpublishVolume(t *testing.T) {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCNodeServer(t, svc)
-	defer cleanup()
+	client := newNodeClient(t, svc)
 
 	// Invalid input
 	_, err = client.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{})
@@ -674,21 +573,13 @@ func TestNodeService_ErrorHandling(t *testing.T) {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCNodeServer(t, svc)
-	defer cleanup()
+	client := newNodeClient(t, svc)
 
 	// Format and mount error returns Internal code
 	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: filepath.Join(tmpDir, "stage-err"),
-		VolumeCapability: &csi.VolumeCapability{
-			AccessType: &csi.VolumeCapability_Mount{
-				Mount: &csi.VolumeCapability_MountVolume{},
-			},
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-			},
-		},
+		VolumeCapability:  mountCapability(""),
 	})
 	if status.Code(err) != codes.Internal {
 		t.Errorf("expected Internal status code for stage error, got: %v", status.Code(err))
@@ -699,14 +590,7 @@ func TestNodeService_ErrorHandling(t *testing.T) {
 		VolumeId:          "vol-123",
 		StagingTargetPath: filepath.Join(tmpDir, "stage-ok"),
 		TargetPath:        filepath.Join(tmpDir, "publish-err"),
-		VolumeCapability: &csi.VolumeCapability{
-			AccessType: &csi.VolumeCapability_Mount{
-				Mount: &csi.VolumeCapability_MountVolume{},
-			},
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-			},
-		},
+		VolumeCapability:  mountCapability(""),
 	})
 	if status.Code(err) != codes.Internal {
 		t.Errorf("expected Internal status code for publish error, got: %v", status.Code(err))
@@ -774,21 +658,13 @@ func TestNodeService_DeviceDiscoveryFromPublishContext(t *testing.T) {
 				t.Fatalf("NewNodeService failed: %v", err)
 			}
 
-			client, cleanup := setupGRPCNodeServer(t, svc)
-			defer cleanup()
+			client := newNodeClient(t, svc)
 
 			_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 				VolumeId:          "vol-123",
 				StagingTargetPath: filepath.Join(tmpDir, "staging"),
 				PublishContext:    tt.publishContext,
-				VolumeCapability: &csi.VolumeCapability{
-					AccessType: &csi.VolumeCapability_Mount{
-						Mount: &csi.VolumeCapability_MountVolume{},
-					},
-					AccessMode: &csi.VolumeCapability_AccessMode{
-						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-					},
-				},
+				VolumeCapability:  mountCapability(""),
 			})
 			if err != nil {
 				t.Fatalf("NodeStageVolume failed: %v", err)

@@ -156,32 +156,7 @@ func newEmulatedNodeClient(t *testing.T, host *emulatedHost) csi.NodeClient {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCNodeServer(t, svc)
-	t.Cleanup(cleanup)
-
-	return client
-}
-
-func mountCapability(fsType string) *csi.VolumeCapability {
-	return &csi.VolumeCapability{
-		AccessType: &csi.VolumeCapability_Mount{
-			Mount: &csi.VolumeCapability_MountVolume{FsType: fsType},
-		},
-		AccessMode: &csi.VolumeCapability_AccessMode{
-			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-		},
-	}
-}
-
-func blockCapability() *csi.VolumeCapability {
-	return &csi.VolumeCapability{
-		AccessType: &csi.VolumeCapability_Block{
-			Block: &csi.VolumeCapability_BlockVolume{},
-		},
-		AccessMode: &csi.VolumeCapability_AccessMode{
-			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-		},
-	}
+	return newNodeClient(t, svc)
 }
 
 func TestNodeService_MountedVolumeLifecycleOnEmulatedHost(t *testing.T) {
@@ -532,8 +507,7 @@ func TestNodeService_NodeGetInfoReportsNodeIDFromFlags(t *testing.T) {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
 
-	client, cleanup := setupGRPCNodeServer(t, svc)
-	defer cleanup()
+	client := newNodeClient(t, svc)
 
 	res, err := client.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
 	if err != nil {
