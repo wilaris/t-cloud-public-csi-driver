@@ -206,6 +206,36 @@ func (s *ControllerService) CreateVolume(
 					),
 				)
 			}
+			limitBytes := req.GetCapacityRange().GetLimitBytes()
+			if limitBytes > 0 && int64(vol.Size)*bytesInGiB > limitBytes {
+				return nil, status.Error(
+					codes.AlreadyExists,
+					fmt.Sprintf(
+						"volume %q already exists with size %d GiB, exceeding limit_bytes %d",
+						req.GetName(),
+						vol.Size,
+						limitBytes,
+					),
+				)
+			}
+			if vol.VolumeType != volType {
+				return nil, status.Error(
+					codes.AlreadyExists,
+					fmt.Sprintf(
+						"volume %q already exists with an incompatible volume type",
+						req.GetName(),
+					),
+				)
+			}
+			if vol.AvailabilityZone != zone {
+				return nil, status.Error(
+					codes.AlreadyExists,
+					fmt.Sprintf(
+						"volume %q already exists in an incompatible availability zone",
+						req.GetName(),
+					),
+				)
+			}
 			return formatCreateVolumeResponse(&vol, req.GetParameters()), nil
 		}
 	}

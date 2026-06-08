@@ -522,19 +522,118 @@ func TestCreateVolume_Idempotency(t *testing.T) {
 		)
 	}
 
-	// Retry with larger capacity -> expect AlreadyExists
-	largeReq := &csi.CreateVolumeRequest{
+	compatibleReq := &csi.CreateVolumeRequest{
 		Name: "idempotent-vol",
 		CapacityRange: &csi.CapacityRange{
-			RequiredBytes: 50 * 1024 * 1024 * 1024,
+			RequiredBytes: 1 * 1024 * 1024 * 1024,
+			LimitBytes:    10 * 1024 * 1024 * 1024,
 		},
 		VolumeCapabilities:        req.VolumeCapabilities,
 		AccessibilityRequirements: req.AccessibilityRequirements,
 	}
 
-	_, err = svc.CreateVolume(context.Background(), largeReq)
-	if status.Code(err) != codes.AlreadyExists {
-		t.Errorf("expected AlreadyExists error for conflicting size, got %v", err)
+	resp3, err := svc.CreateVolume(context.Background(), compatibleReq)
+	if err != nil {
+		t.Fatalf("compatible CreateVolume retry failed: %v", err)
+	}
+	if resp3.Volume.VolumeId != resp1.Volume.VolumeId {
+		t.Errorf(
+			"expected compatible retry to return volume ID %s, got %s",
+			resp1.Volume.VolumeId,
+			resp3.Volume.VolumeId,
+		)
+	}
+}
+
+func TestCreateVolume_IdempotencyRejectsIncompatibleVolume(t *testing.T) {
+	t.Parallel()
+
+	const gib = int64(1024 * 1024 * 1024)
+
+	tests := []struct {
+		name          string
+		sizeGiB       int
+		volumeType    string
+		zone          string
+		requiredBytes int64
+		limitBytes    int64
+	}{
+		{
+			name:          "below required size",
+			sizeGiB:       5,
+			volumeType:    "SSD",
+			zone:          "eu-de-01",
+			requiredBytes: 10 * gib,
+			limitBytes:    20 * gib,
+		},
+		{
+			name:          "above size limit",
+			sizeGiB:       20,
+			volumeType:    "SSD",
+			zone:          "eu-de-01",
+			requiredBytes: 5 * gib,
+			limitBytes:    10 * gib,
+		},
+		{
+			name:          "different volume type",
+			sizeGiB:       10,
+			volumeType:    "SAS",
+			zone:          "eu-de-01",
+			requiredBytes: 5 * gib,
+			limitBytes:    20 * gib,
+		},
+		{
+			name:          "different availability zone",
+			sizeGiB:       10,
+			volumeType:    "SSD",
+			zone:          "eu-de-02",
+			requiredBytes: 5 * gib,
+			limitBytes:    20 * gib,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newMockEVSClient()
+			_, err := client.CreateVolume(context.Background(), evs.CreateVolumeOpts{
+				Name:             "existing-volume",
+				Size:             tt.sizeGiB,
+				AvailabilityZone: tt.zone,
+				VolumeType:       tt.volumeType,
+			})
+			if err != nil {
+				t.Fatalf("create existing volume: %v", err)
+			}
+
+			svc, err := driver.NewControllerService(client, validTestConfig())
+			if err != nil {
+				t.Fatalf("NewControllerService failed: %v", err)
+			}
+
+			_, err = svc.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+				Name: "existing-volume",
+				CapacityRange: &csi.CapacityRange{
+					RequiredBytes: tt.requiredBytes,
+					LimitBytes:    tt.limitBytes,
+				},
+				VolumeCapabilities: []*csi.VolumeCapability{
+					mountCapability(""),
+				},
+				Parameters: map[string]string{
+					"type": "SSD",
+				},
+				AccessibilityRequirements: &csi.TopologyRequirement{
+					Requisite: []*csi.Topology{
+						{Segments: map[string]string{driver.TopologyZoneKey: "eu-de-01"}},
+					},
+				},
+			})
+			if status.Code(err) != codes.AlreadyExists {
+				t.Errorf("expected AlreadyExists for incompatible volume, got %v", err)
+			}
+		})
 	}
 }
 
