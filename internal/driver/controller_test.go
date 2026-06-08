@@ -20,6 +20,7 @@ import (
 type mockEVSClient struct {
 	volumes     map[string]*evs.Volume
 	attachments map[string]string
+	lastCreate  evs.CreateVolumeOpts
 }
 
 func newMockEVSClient() *mockEVSClient {
@@ -33,6 +34,7 @@ func (m *mockEVSClient) CreateVolume(
 	ctx context.Context,
 	opts evs.CreateVolumeOpts,
 ) (*evs.Volume, error) {
+	m.lastCreate = opts
 	vol := &evs.Volume{
 		ID:               fmt.Sprintf("vol-%s", opts.Name),
 		Name:             opts.Name,
@@ -460,9 +462,16 @@ func TestCreateVolume_TopologyRoundTrip(t *testing.T) {
 	if nodeTopology == nil {
 		t.Fatal("NodeGetInfo did not return accessible topology")
 	}
+	nodeZone, ok := nodeTopology.GetSegments()[driver.TopologyZoneKey]
+	if !ok {
+		t.Fatalf("NodeGetInfo topology does not contain %q", driver.TopologyZoneKey)
+	}
+	if nodeZone != cfg.AvailabilityZone {
+		t.Fatalf("expected node zone %q, got %q", cfg.AvailabilityZone, nodeZone)
+	}
 
 	controllerClient := csi.NewControllerClient(conn)
-	created, err := controllerClient.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+	request := &csi.CreateVolumeRequest{
 		Name: "topology-round-trip",
 		VolumeCapabilities: []*csi.VolumeCapability{
 			mountCapability(""),
@@ -470,18 +479,38 @@ func TestCreateVolume_TopologyRoundTrip(t *testing.T) {
 		AccessibilityRequirements: &csi.TopologyRequirement{
 			Requisite: []*csi.Topology{nodeTopology},
 		},
-	})
+	}
+	requestZone := request.GetAccessibilityRequirements().GetRequisite()[0].GetSegments()[driver.TopologyZoneKey]
+	if requestZone != nodeZone {
+		t.Fatalf("expected Controller request zone %q, got %q", nodeZone, requestZone)
+	}
+
+	created, err := controllerClient.CreateVolume(context.Background(), request)
 	if err != nil {
 		t.Fatalf("CreateVolume failed: %v", err)
+	}
+	if evsClient.lastCreate.AvailabilityZone != requestZone {
+		t.Fatalf(
+			"expected EVS create zone %q, got %q",
+			requestZone,
+			evsClient.lastCreate.AvailabilityZone,
+		)
 	}
 
 	accessibleTopology := created.GetVolume().GetAccessibleTopology()
 	if len(accessibleTopology) != 1 {
 		t.Fatalf("expected one accessible topology, got %d", len(accessibleTopology))
 	}
-	createdZone := accessibleTopology[0].GetSegments()[driver.TopologyZoneKey]
-	if createdZone != cfg.AvailabilityZone {
-		t.Errorf("expected created volume zone %q, got %q", cfg.AvailabilityZone, createdZone)
+	createdZone, ok := accessibleTopology[0].GetSegments()[driver.TopologyZoneKey]
+	if !ok {
+		t.Fatalf("created volume topology does not contain %q", driver.TopologyZoneKey)
+	}
+	if createdZone != evsClient.lastCreate.AvailabilityZone {
+		t.Errorf(
+			"expected created volume zone %q, got %q",
+			evsClient.lastCreate.AvailabilityZone,
+			createdZone,
+		)
 	}
 }
 
