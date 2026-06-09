@@ -80,75 +80,141 @@ func (e fakeExitError) Error() string   { return e.String() }
 func (e fakeExitError) Exited() bool    { return true }
 func (e fakeExitError) ExitStatus() int { return e.code }
 
-func TestDiscoverDevice(t *testing.T) {
-	tmpDir := t.TempDir()
-	byIDDir := filepath.Join(tmpDir, "by-id")
+// newDeviceTree builds a fake /dev + by-id tree for discovery tests.
+func newDeviceTree(t *testing.T) (*LinuxMounter, string, string, string) {
+	t.Helper()
+
+	tmpDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to resolve temporary directory: %v", err)
+	}
+
+	devDir := filepath.Join(tmpDir, "dev")
+	byIDDir := filepath.Join(devDir, "disk", "by-id")
 	if err := os.MkdirAll(byIDDir, 0o750); err != nil {
 		t.Fatalf("failed to create temp by-id dir: %v", err)
 	}
 
-	volID := "vol-12345678"
-	targetFile := filepath.Join(byIDDir, "virtio-"+volID)
-	if err := os.WriteFile(targetFile, []byte("fake-device"), 0o600); err != nil {
+	device := filepath.Join(devDir, "vdb")
+	if err := os.WriteFile(device, []byte("fake-device"), 0o600); err != nil {
 		t.Fatalf("failed to write dummy device: %v", err)
 	}
 
-	mounter := NewLinuxMounter(WithDiskByIDDir(byIDDir))
+	mounter := NewLinuxMounter(WithDevDir(devDir), WithDiskByIDDir(byIDDir))
+
+	return mounter, devDir, byIDDir, device
+}
+
+func TestDiscoverDevice(t *testing.T) {
+	mounter, _, byIDDir, device := newDeviceTree(t)
 	ctx := context.Background()
 
-	// Empty ID test
-	_, err := mounter.DiscoverDevice(ctx, "")
+	volID := "vol-12345678"
+	link := filepath.Join(byIDDir, "virtio-"+volID)
+	if err := os.Symlink(device, link); err != nil {
+		t.Fatalf("failed to link the attached device: %v", err)
+	}
+
+	// Empty volume ID test
+	_, err := mounter.DiscoverDevice(ctx, "", device)
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Errorf("expected ErrInvalidInput, got: %v", err)
 	}
 
-	// Successful discovery with virtio prefix
-	found, err := mounter.DiscoverDevice(ctx, volID)
+	// Empty published path is invalid.
+	_, err = mounter.DiscoverDevice(ctx, volID, "")
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for an empty published path, got: %v", err)
+	}
+
+	// Successful discovery: the by-id link and the published path name the same device
+	found, err := mounter.DiscoverDevice(ctx, volID, device)
 	if err != nil {
 		t.Fatalf("expected discovery success, got: %v", err)
 	}
-	if found != targetFile {
-		t.Errorf("expected %s, got %s", targetFile, found)
+	if found != device {
+		t.Errorf("expected %s, got %s", device, found)
 	}
 
-	// Absolute path existing file
-	absFound, err := mounter.DiscoverDevice(ctx, targetFile)
-	if err != nil {
-		t.Fatalf("expected abs path discovery success, got: %v", err)
-	}
-	if absFound != targetFile {
-		t.Errorf("expected %s, got %s", targetFile, absFound)
-	}
-
-	// Nonexistent device test
-	_, err = mounter.DiscoverDevice(ctx, "nonexistent-vol")
+	// Nonexistent device test: no by-id link claims the volume
+	_, err = mounter.DiscoverDevice(ctx, "nonexistent-vol", device)
 	if !errors.Is(err, ErrDeviceNotFound) {
 		t.Errorf("expected ErrDeviceNotFound, got: %v", err)
 	}
 }
 
 func TestDiscoverDeviceTruncatedVirtioSerial(t *testing.T) {
-	tmpDir := t.TempDir()
-	byIDDir := filepath.Join(tmpDir, "by-id")
-	if err := os.MkdirAll(byIDDir, 0o750); err != nil {
-		t.Fatalf("failed to create temp by-id dir: %v", err)
-	}
+	mounter, _, byIDDir, device := newDeviceTree(t)
 
 	// udev truncates the volume UUID to the length of the VirtIO serial field.
 	volumeID := "6f1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"
 	link := filepath.Join(byIDDir, "virtio-"+volumeID[:virtioSerialMaxLen])
-	if err := os.WriteFile(link, []byte("fake-device"), 0o600); err != nil {
-		t.Fatalf("failed to write dummy device: %v", err)
+	if err := os.Symlink(device, link); err != nil {
+		t.Fatalf("failed to link the attached device: %v", err)
 	}
 
-	mounter := NewLinuxMounter(WithDiskByIDDir(byIDDir))
-
-	found, err := mounter.DiscoverDevice(context.Background(), volumeID)
+	found, err := mounter.DiscoverDevice(context.Background(), volumeID, device)
 	if err != nil {
-		t.Fatalf("expected discovery via truncated serial, got: %v", err)
+		t.Fatalf("expected discovery via an agreeing truncated serial, got: %v", err)
 	}
-	if found != link {
-		t.Errorf("expected %s, got %s", link, found)
+	if found != device {
+		t.Errorf("expected %s, got %s", device, found)
+	}
+}
+
+func TestDiscoverDeviceRejectsDisagreeingIdentity(t *testing.T) {
+	mounter, devDir, byIDDir, device := newDeviceTree(t)
+
+	// The volume's by-id link names another device than the published path.
+	other := filepath.Join(devDir, "vdc")
+	if err := os.WriteFile(other, []byte("other-volume"), 0o600); err != nil {
+		t.Fatalf("failed to write second device: %v", err)
+	}
+	volID := "vol-12345678"
+	link := filepath.Join(byIDDir, "virtio-"+volID)
+	if err := os.Symlink(other, link); err != nil {
+		t.Fatalf("failed to link the other device: %v", err)
+	}
+
+	_, err := mounter.DiscoverDevice(context.Background(), volID, device)
+	if !errors.Is(err, ErrDeviceIdentityUnverified) {
+		t.Errorf("expected ErrDeviceIdentityUnverified, got: %v", err)
+	}
+}
+
+func TestDiscoverDeviceRejectsPathOutsideDeviceDirectory(t *testing.T) {
+	mounter, devDir, byIDDir, device := newDeviceTree(t)
+
+	volID := "vol-12345678"
+	link := filepath.Join(byIDDir, "virtio-"+volID)
+	if err := os.Symlink(device, link); err != nil {
+		t.Fatalf("failed to link the attached device: %v", err)
+	}
+
+	// Paths outside the device dir are invalid.
+	outside := filepath.Join(filepath.Dir(devDir), "not-a-device")
+	if err := os.WriteFile(outside, []byte("outside"), 0o600); err != nil {
+		t.Fatalf("failed to write outside file: %v", err)
+	}
+
+	_, err := mounter.DiscoverDevice(context.Background(), volID, outside)
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for a path outside %s, got: %v", devDir, err)
+	}
+}
+
+func TestDiscoverDeviceRejectsAbsentPublishedPath(t *testing.T) {
+	mounter, devDir, byIDDir, device := newDeviceTree(t)
+
+	volID := "vol-12345678"
+	link := filepath.Join(byIDDir, "virtio-"+volID)
+	if err := os.Symlink(device, link); err != nil {
+		t.Fatalf("failed to link the attached device: %v", err)
+	}
+
+	_, err := mounter.DiscoverDevice(context.Background(), volID, filepath.Join(devDir, "vdz"))
+	if !errors.Is(err, ErrDeviceNotFound) {
+		t.Errorf("expected ErrDeviceNotFound for an absent published path, got: %v", err)
 	}
 }
 
@@ -181,7 +247,7 @@ func TestGetFilesystemType(t *testing.T) {
 		t.Errorf("expected empty fsType for unformatted, got: %s, err: %v", fsType, err)
 	}
 
-	// blkid exit status 2 reports a device that carries no filesystem
+	// blkid exit status 2 reports a device with no filesystem
 	fe.handlers["blkid"] = func(args ...string) ([]byte, error) {
 		return []byte(""), fakeExitError{code: blkidNoFilesystem}
 	}
@@ -274,7 +340,7 @@ func TestMount(t *testing.T) {
 		)
 	}
 
-	// A canceled context is rejected before any host call.
+	// Canceled context returns context.Canceled.
 	cancelledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	err := mounter.Mount(cancelledCtx, "/dev/sdb", filepath.Join(tmpDir, "other"), "", nil)
@@ -382,7 +448,7 @@ func TestFormatAndMount(t *testing.T) {
 		t.Errorf("expected ErrFilesystemMismatch, got %v", err)
 	}
 
-	// A device whose filesystem cannot be determined must not be formatted.
+	// Skip format when filesystem detection fails.
 	undetectableExec := newFakeExec()
 	undetectableExec.handlers["blkid"] = func(args ...string) ([]byte, error) {
 		return nil, errors.New("blkid unavailable")

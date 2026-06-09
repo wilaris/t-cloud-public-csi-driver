@@ -18,7 +18,7 @@ import (
 )
 
 type fakeMounter struct {
-	discoverDeviceFn    func(ctx context.Context, id string) (string, error)
+	discoverDeviceFn    func(ctx context.Context, volumeID, publishedDevicePath string) (string, error)
 	formatAndMountFn    func(ctx context.Context, source, target, fsType string, options []string) error
 	mountFn             func(ctx context.Context, source, target, fsType string, options []string) error
 	unmountFn           func(ctx context.Context, target string) error
@@ -27,11 +27,20 @@ type fakeMounter struct {
 	getMountSourceFn    func(ctx context.Context, target string) (string, error)
 }
 
-func (f *fakeMounter) DiscoverDevice(ctx context.Context, id string) (string, error) {
+func (f *fakeMounter) DiscoverDevice(
+	ctx context.Context,
+	volumeID, publishedDevicePath string,
+) (string, error) {
 	if f.discoverDeviceFn != nil {
-		return f.discoverDeviceFn(ctx, id)
+		return f.discoverDeviceFn(ctx, volumeID, publishedDevicePath)
 	}
 	return "/dev/sdb", nil
+}
+
+// attachedPublishContext is the publish context from a successful ControllerPublishVolume
+// (devicePath required).
+func attachedPublishContext() map[string]string {
+	return map[string]string{"devicePath": "/dev/vdb"}
 }
 
 func (f *fakeMounter) FormatAndMount(
@@ -173,8 +182,7 @@ func TestNodeService_NodeGetInfo(t *testing.T) {
 		t.Fatal("expected accessible topology")
 	}
 
-	// The node must report its availability zone, not its region: a region spans several
-	// zones, so it can never match the zone CreateVolume reports for a provisioned volume.
+	// Zone must match CreateVolume topology.
 	gotZone := topo.GetSegments()[driver.TopologyZoneKey]
 	if gotZone != cfg.AvailabilityZone {
 		t.Errorf("expected zone topology %q, got %q", cfg.AvailabilityZone, gotZone)
@@ -224,8 +232,8 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 
 	var formattedAndMounted bool
 	fm := &fakeMounter{
-		discoverDeviceFn: func(ctx context.Context, id string) (string, error) {
-			if id == "vol-missing" {
+		discoverDeviceFn: func(ctx context.Context, volumeID, _ string) (string, error) {
+			if volumeID == "vol-missing" {
 				return "", mount.ErrDeviceNotFound
 			}
 			return "/dev/sdb", nil
@@ -256,6 +264,7 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-missing",
 		StagingTargetPath: stagingPath,
+		PublishContext:    attachedPublishContext(),
 		VolumeCapability:  mountCapability(""),
 	})
 	if status.Code(err) != codes.NotFound {
@@ -266,6 +275,7 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: stagingPath,
+		PublishContext:    attachedPublishContext(),
 		VolumeCapability:  mountCapability("ext4"),
 	})
 	if err != nil {
@@ -280,6 +290,7 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: blockStagingPath,
+		PublishContext:    attachedPublishContext(),
 		VolumeCapability:  blockCapability(),
 	})
 	if err != nil {
@@ -355,7 +366,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 	var mounts []recordedMount
 	var formatted bool
 	fm := &fakeMounter{
-		discoverDeviceFn: func(ctx context.Context, id string) (string, error) {
+		discoverDeviceFn: func(ctx context.Context, volumeID, _ string) (string, error) {
 			return "/dev/sdb", nil
 		},
 		formatAndMountFn: func(ctx context.Context, source, target, fsType string, options []string) error {
@@ -476,6 +487,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 		VolumeId:          "vol-123",
 		StagingTargetPath: stagingPath,
 		TargetPath:        blockTargetPath,
+		PublishContext:    attachedPublishContext(),
 		VolumeCapability:  blockCapability(),
 	})
 	if err != nil {
@@ -579,6 +591,7 @@ func TestNodeService_ErrorHandling(t *testing.T) {
 	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: filepath.Join(tmpDir, "stage-err"),
+		PublishContext:    attachedPublishContext(),
 		VolumeCapability:  mountCapability(""),
 	})
 	if status.Code(err) != codes.Internal {
@@ -615,26 +628,25 @@ func TestNodeService_DeviceDiscoveryFromPublishContext(t *testing.T) {
 	tests := []struct {
 		name           string
 		publishContext map[string]string
-		known          string
-		wantIdentifier string
+		wantPublished  string
+		wantCode       codes.Code
 	}{
 		{
-			name:           "prefers the device path reported at attach time",
+			name:           "hands the volume ID and the attach-time device path to the mounter",
 			publishContext: map[string]string{"devicePath": "/dev/vdb"},
-			known:          "/dev/vdb",
-			wantIdentifier: "/dev/vdb",
+			wantPublished:  "/dev/vdb",
+			wantCode:       codes.OK,
 		},
 		{
-			name:           "falls back to the volume ID when no device path is published",
+			// Missing devicePath is InvalidArgument before DiscoverDevice.
+			name:           "rejects a request that publishes no device path",
 			publishContext: nil,
-			known:          "vol-123",
-			wantIdentifier: "vol-123",
+			wantCode:       codes.InvalidArgument,
 		},
 		{
-			name:           "falls back to the volume ID when the published path is stale",
-			publishContext: map[string]string{"devicePath": "/dev/gone"},
-			known:          "vol-123",
-			wantIdentifier: "vol-123",
+			name:           "rejects a request that publishes a blank device path",
+			publishContext: map[string]string{"devicePath": "   "},
+			wantCode:       codes.InvalidArgument,
 		},
 	}
 
@@ -642,13 +654,16 @@ func TestNodeService_DeviceDiscoveryFromPublishContext(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			var resolved string
+			var gotVolumeID, gotPublished string
+			reachedHost := false
 			fm := &fakeMounter{
-				discoverDeviceFn: func(ctx context.Context, id string) (string, error) {
-					if id != tt.known {
-						return "", mount.ErrDeviceNotFound
-					}
-					resolved = id
+				discoverDeviceFn: func(
+					ctx context.Context,
+					volumeID, publishedDevicePath string,
+				) (string, error) {
+					reachedHost = true
+					gotVolumeID = volumeID
+					gotPublished = publishedDevicePath
 					return "/dev/sdb", nil
 				},
 			}
@@ -662,20 +677,59 @@ func TestNodeService_DeviceDiscoveryFromPublishContext(t *testing.T) {
 
 			_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
 				VolumeId:          "vol-123",
-				StagingTargetPath: filepath.Join(tmpDir, "staging"),
+				StagingTargetPath: filepath.Join(tmpDir, "staging-"+tt.name),
 				PublishContext:    tt.publishContext,
 				VolumeCapability:  mountCapability(""),
 			})
-			if err != nil {
-				t.Fatalf("NodeStageVolume failed: %v", err)
+			if status.Code(err) != tt.wantCode {
+				t.Fatalf("expected status %v, got %v", tt.wantCode, err)
 			}
-			if resolved != tt.wantIdentifier {
+
+			if tt.wantCode != codes.OK {
+				if reachedHost {
+					t.Errorf("the node reached the host without a published device path")
+				}
+				return
+			}
+			if gotVolumeID != "vol-123" {
+				t.Errorf("expected discovery for volume %q, got %q", "vol-123", gotVolumeID)
+			}
+			if gotPublished != tt.wantPublished {
 				t.Errorf(
-					"expected device discovery via %q, got %q",
-					tt.wantIdentifier,
-					resolved,
+					"expected the published device path %q, got %q",
+					tt.wantPublished,
+					gotPublished,
 				)
 			}
 		})
+	}
+}
+
+func TestNodeService_DeviceIdentityMismatch(t *testing.T) {
+	t.Parallel()
+
+	fm := &fakeMounter{
+		discoverDeviceFn: func(
+			ctx context.Context,
+			volumeID, publishedDevicePath string,
+		) (string, error) {
+			return "", mount.ErrDeviceIdentityUnverified
+		},
+	}
+
+	svc, err := driver.NewNodeService(fm, validTestConfig())
+	if err != nil {
+		t.Fatalf("NewNodeService failed: %v", err)
+	}
+	client := newNodeClient(t, svc)
+
+	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-123",
+		StagingTargetPath: filepath.Join(t.TempDir(), "staging"),
+		PublishContext:    attachedPublishContext(),
+		VolumeCapability:  mountCapability(""),
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("expected FailedPrecondition for a device identity mismatch, got: %v", err)
 	}
 }

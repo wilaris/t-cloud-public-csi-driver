@@ -38,8 +38,7 @@ func rawBlockCapability(mode csi.VolumeCapability_AccessMode_Mode) *csi.VolumeCa
 	}
 }
 
-// allAccessModes lists every access mode the pinned CSI specification defines, so a mode added by a
-// specification bump is probed rather than silently skipped.
+// allAccessModes lists every CSI access mode so a new mode from a spec bump is covered.
 func allAccessModes() []csi.VolumeCapability_AccessMode_Mode {
 	names := csi.VolumeCapability_AccessMode_Mode_name
 	modes := make([]csi.VolumeCapability_AccessMode_Mode, 0, len(names))
@@ -51,15 +50,17 @@ func allAccessModes() []csi.VolumeCapability_AccessMode_Mode {
 	return modes
 }
 
-// recordingMounter records the host operations a request reached. It never fails, so a zero
-// count means the driver refused the request before touching the host.
+// recordingMounter counts host ops; failures never come from the mounter.
 type recordingMounter struct {
 	discoverDevice int
 	formatAndMount int
 	mounts         []recordedMount
 }
 
-func (m *recordingMounter) DiscoverDevice(ctx context.Context, id string) (string, error) {
+func (m *recordingMounter) DiscoverDevice(
+	ctx context.Context,
+	volumeID, publishedDevicePath string,
+) (string, error) {
 	m.discoverDevice++
 
 	return "/dev/sdb", nil
@@ -140,10 +141,7 @@ type capabilityProbeResult struct {
 	attached  int
 }
 
-// probeCapability runs one capability-validating RPC with all cloud and host operations
-// succeeding, so any refusal comes from capability validation itself. readonly=true also
-// exercises the read-only consistency checks; callers combining it with a rejected
-// capability must tell the two refusal sources apart.
+// probeCapability runs one capability-validating RPC with cloud/host ops succeeding.
 func probeCapability(
 	t *testing.T,
 	rpc capabilityRPC,
@@ -215,6 +213,7 @@ func probeCapability(
 		_, result.err = node.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
 			VolumeId:          vol.ID,
 			StagingTargetPath: filepath.Join(tmpDir, "staging"),
+			PublishContext:    attachedPublishContext(),
 			VolumeCapability:  volCap,
 		})
 
@@ -223,6 +222,7 @@ func probeCapability(
 			VolumeId:          vol.ID,
 			StagingTargetPath: filepath.Join(tmpDir, "staging"),
 			TargetPath:        filepath.Join(tmpDir, "target"),
+			PublishContext:    attachedPublishContext(),
 			VolumeCapability:  volCap,
 			Readonly:          readonly,
 		})
@@ -237,8 +237,7 @@ func probeCapability(
 	return result
 }
 
-// assertCapabilityVerdict checks one RPC's verdict: INVALID_ARGUMENT with no side effects,
-// except ValidateVolumeCapabilities, which rejects by returning an unconfirmed response.
+// assertCapabilityVerdict checks InvalidArgument (or unconfirmed Validate).
 func assertCapabilityVerdict(
 	t *testing.T,
 	rpc capabilityRPC,
@@ -263,7 +262,7 @@ func assertCapabilityVerdict(
 			t.Fatalf("%s: expected an unconfirmed response, not a gRPC error: %v", rpc, got.err)
 		}
 		if got.confirmed {
-			t.Fatalf("%s: expected confirmation to be withheld for a refused capability", rpc)
+			t.Fatalf("%s: expected no confirmation for a rejected capability", rpc)
 		}
 
 		return
@@ -368,9 +367,7 @@ func TestCapabilityContract_RawBlockConsultsNoFilesystem(t *testing.T) {
 			got := probeCapability(t, rpc, volCap, false)
 			assertCapabilityVerdict(t, rpc, got, true)
 
-			// Only the two Node RPCs reach the host, so only they can show that raw block access
-			// consulted no filesystem. Staging is what would format one; publishing is what would
-			// name one on the mount.
+			// Node stage/publish only: raw block must not format or set an fs type.
 			if rpc != rpcNodeStageVolume && rpc != rpcNodePublishVolume {
 				return
 			}
@@ -395,7 +392,7 @@ func TestCapabilityContract_RawBlockConsultsNoFilesystem(t *testing.T) {
 	}
 }
 
-func TestControllerPublishVolume_RefusesAReadOnlyRequestWithoutAttaching(t *testing.T) {
+func TestControllerPublishVolume_RejectsAReadOnlyRequestWithoutAttaching(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -412,21 +409,21 @@ func TestControllerPublishVolume_RefusesAReadOnlyRequestWithoutAttaching(t *test
 
 			volCap := mountedCapability(tt.mode, "ext4")
 
-			refused := probeCapability(t, rpcControllerPublishVolume, volCap, true)
-			if status.Code(refused.err) != codes.InvalidArgument {
+			rejected := probeCapability(t, rpcControllerPublishVolume, volCap, true)
+			if status.Code(rejected.err) != codes.InvalidArgument {
 				t.Fatalf(
 					"expected InvalidArgument for a read-only publish request, got %v",
-					refused.err,
+					rejected.err,
 				)
 			}
-			if refused.attached != 0 {
+			if rejected.attached != 0 {
 				t.Errorf(
-					"expected no attachment for a refused read-only publish, got %d",
-					refused.attached,
+					"expected no attachment for a rejected read-only publish, got %d",
+					rejected.attached,
 				)
 			}
 
-			// Control: the same request without the flag must attach.
+			// Same request without the flag must attach.
 			accepted := probeCapability(t, rpcControllerPublishVolume, volCap, false)
 			if accepted.err != nil {
 				t.Fatalf("expected a writable publish request to succeed, got %v", accepted.err)
@@ -493,7 +490,7 @@ func TestNodePublishVolume_RequiresAReadOnlyPublicationForAReadOnlyMode(t *testi
 				}
 				if len(got.mounter.mounts) != 0 {
 					t.Errorf(
-						"expected no mount for a refused publication, got %v",
+						"expected no mount for a rejected publication, got %v",
 						got.mounter.mounts,
 					)
 				}
@@ -518,8 +515,7 @@ func TestNodePublishVolume_RequiresAReadOnlyPublicationForAReadOnlyMode(t *testi
 	}
 }
 
-// conflictEVSClient reports the same cloud conflict from every operation. The status a caller
-// observes can then only come from the operation that made the call.
+// conflictEVSClient returns ErrConflict from every EVS call.
 type conflictEVSClient struct{}
 
 func conflictError() error {
@@ -548,16 +544,18 @@ func (conflictEVSClient) DeleteVolume(ctx context.Context, id string) error {
 	return conflictError()
 }
 
-func (conflictEVSClient) AttachVolume(ctx context.Context, volumeID, serverID string) error {
-	return conflictError()
+func (conflictEVSClient) AttachVolume(
+	ctx context.Context,
+	volumeID, serverID string,
+) (*evs.Attachment, error) {
+	return nil, conflictError()
 }
 
 func (conflictEVSClient) DetachVolume(ctx context.Context, volumeID, serverID string) error {
 	return conflictError()
 }
 
-// createConflictEVSClient reports no existing volume and a conflict from creation itself, reaching
-// the second call site inside CreateVolume that maps a conflict.
+// createConflictEVSClient: Discover not found, Create conflicts.
 type createConflictEVSClient struct {
 	conflictEVSClient
 }
@@ -689,7 +687,7 @@ func TestControllerConflictCarriesTheStatusOfItsOperation(t *testing.T) {
 	}
 }
 
-func TestDeleteVolume_RefusesAVolumeWithoutTheOwnershipMarker(t *testing.T) {
+func TestDeleteVolume_RejectsAVolumeWithoutTheOwnershipMarker(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
@@ -743,9 +741,7 @@ func TestValidateVolumeCapabilities_EchoesEveryConfirmedField(t *testing.T) {
 	}
 	params := map[string]string{"type": "SSD", "availability_zone": "eu-de-01"}
 
-	// The call goes over the wire so the response is an independent decoding. Calling the service
-	// directly would compare the request's own map and capability pointers against themselves, which
-	// no echo defect could fail.
+	// Use a gRPC client so Confirmed is a decoded copy, not the request pointers.
 	resp, err := newControllerClient(t, svc).ValidateVolumeCapabilities(
 		ctx,
 		&csi.ValidateVolumeCapabilitiesRequest{
@@ -783,8 +779,7 @@ func TestValidateVolumeCapabilities_EchoesEveryConfirmedField(t *testing.T) {
 		)
 	}
 
-	// Provisioning issues an empty volume context, so the only context this response can confirm is
-	// an empty one.
+	// CreateVolume leaves volume context empty.
 	if len(confirmed.GetVolumeContext()) != 0 {
 		t.Errorf(
 			"expected an empty confirmed volume context, got %v",
@@ -793,7 +788,7 @@ func TestValidateVolumeCapabilities_EchoesEveryConfirmedField(t *testing.T) {
 	}
 }
 
-func TestValidateVolumeCapabilities_WithholdsConfirmationWithoutFailing(t *testing.T) {
+func TestValidateVolumeCapabilities_UnconfirmedWithoutError(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
@@ -804,7 +799,7 @@ func TestValidateVolumeCapabilities_WithholdsConfirmationWithoutFailing(t *testi
 
 	ctx := context.Background()
 	vol, err := client.CreateVolume(ctx, evs.CreateVolumeOpts{
-		Name:             "withhold-vol",
+		Name:             "unconfirmed-vol",
 		Size:             10,
 		AvailabilityZone: "eu-de-01",
 		VolumeType:       "SSD",
@@ -858,10 +853,9 @@ func TestValidateVolumeCapabilities_WithholdsConfirmationWithoutFailing(t *testi
 					Parameters:    tt.parameters,
 				},
 			)
-			// An unsupported field is reported by withholding confirmation. Returning a gRPC error
-			// instead would tell the orchestrator the request was malformed.
+			// Unsupported fields return Confirmed=nil without a gRPC error.
 			if err != nil {
-				t.Fatalf("expected an unconfirmed response rather than a gRPC error, got %v", err)
+				t.Fatalf("expected Confirmed=nil, got error: %v", err)
 			}
 			if (resp.GetConfirmed() != nil) != tt.confirm {
 				t.Errorf(

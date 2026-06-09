@@ -20,8 +20,8 @@ import (
 	"wilaris.dev/t-cloud-public-csi-driver/internal/mount"
 )
 
-// emulatedVolumeID is the volume the emulated host has an attached device for.
-const emulatedVolumeID = "vol-6f1b2c3d"
+// emulatedVolumeID is long enough that udev truncates the virtio by-id serial.
+const emulatedVolumeID = "6f1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"
 
 // hostCmd answers one block-device command from a canned handler.
 type hostCmd struct {
@@ -81,14 +81,13 @@ func (e *hostExec) countCalls(prefix string) int {
 	return count
 }
 
-// emulatedHost stands in for a Linux worker node offline: an in-memory kernel mount table,
-// a `/dev/disk/by-id` directory holding the device of an attached EVS volume, and canned
-// `blkid`/`mkfs` binaries.
+// emulatedHost is a fake node: mount table, /dev + by-id and canned blkid/mkfs.
 type emulatedHost struct {
 	mounter    *mount.LinuxMounter
 	table      *mountutils.FakeMounter
 	exec       *hostExec
 	devicePath string
+	byIDLink   string
 	dir        string
 }
 
@@ -101,20 +100,27 @@ func newEmulatedHost(t *testing.T) *emulatedHost {
 		t.Fatalf("failed to resolve temporary directory: %v", err)
 	}
 
-	byIDDir := filepath.Join(dir, "by-id")
+	devDir := filepath.Join(dir, "dev")
+	byIDDir := filepath.Join(devDir, "disk", "by-id")
 	if err := os.MkdirAll(byIDDir, 0o750); err != nil {
 		t.Fatalf("failed to create by-id directory: %v", err)
 	}
 
-	// udev exposes an attached VirtIO volume under its truncated serial.
-	devicePath := filepath.Join(byIDDir, "virtio-"+emulatedVolumeID)
+	// The kernel device the cloud reports at attach time.
+	devicePath := filepath.Join(devDir, "vdb")
 	if err := os.WriteFile(devicePath, []byte("attached-evs-volume"), 0o600); err != nil {
 		t.Fatalf("failed to create attached device: %v", err)
 	}
 
+	// udev links the same device under the volume serial, truncated to the VirtIO field length.
+	byIDLink := filepath.Join(byIDDir, "virtio-"+emulatedVolumeID[:20])
+	if err := os.Symlink(devicePath, byIDLink); err != nil {
+		t.Fatalf("failed to link the attached device: %v", err)
+	}
+
 	hostCommands := &hostExec{
 		handlers: map[string]func(args ...string) ([]byte, error){
-			// A freshly attached EVS volume carries no filesystem yet.
+			// Freshly attached EVS volume has no filesystem yet.
 			"blkid":     func(_ ...string) ([]byte, error) { return []byte(""), nil },
 			"lsblk":     func(_ ...string) ([]byte, error) { return []byte(""), nil },
 			"mkfs.ext4": func(_ ...string) ([]byte, error) { return []byte("done"), nil },
@@ -128,13 +134,20 @@ func newEmulatedHost(t *testing.T) *emulatedHost {
 		mounter: mount.NewLinuxMounter(
 			mount.WithMountUtilsInterface(table),
 			mount.WithExecInterface(hostCommands),
+			mount.WithDevDir(devDir),
 			mount.WithDiskByIDDir(byIDDir),
 		),
 		table:      table,
 		exec:       hostCommands,
 		devicePath: devicePath,
+		byIDLink:   byIDLink,
 		dir:        dir,
 	}
+}
+
+// publishContext is the publish context the controller produces for the attached volume.
+func (h *emulatedHost) publishContext() map[string]string {
+	return map[string]string{"devicePath": h.devicePath}
 }
 
 // mountPointAt returns the mount table entry for path, if the path is mounted.
@@ -172,12 +185,14 @@ func TestNodeService_MountedVolumeLifecycleOnEmulatedHost(t *testing.T) {
 	stage := &csi.NodeStageVolumeRequest{
 		VolumeId:          emulatedVolumeID,
 		StagingTargetPath: stagingPath,
+		PublishContext:    host.publishContext(),
 		VolumeCapability:  mountCapability(""),
 	}
 	publish := &csi.NodePublishVolumeRequest{
 		VolumeId:          emulatedVolumeID,
 		StagingTargetPath: stagingPath,
 		TargetPath:        targetPath,
+		PublishContext:    host.publishContext(),
 		VolumeCapability:  mountCapability(""),
 	}
 
@@ -216,8 +231,7 @@ func TestNodeService_MountedVolumeLifecycleOnEmulatedHost(t *testing.T) {
 			host.table.MountPoints,
 		)
 	}
-	// A bind mount of the staged directory resolves to the same device, so the workload
-	// reaches the EVS volume itself at its target path.
+	// Bind mount should surface the same device at the target.
 	if published.Device != host.devicePath {
 		t.Errorf("expected published device %s, got %s", host.devicePath, published.Device)
 	}
@@ -230,8 +244,7 @@ func TestNodeService_MountedVolumeLifecycleOnEmulatedHost(t *testing.T) {
 		t.Errorf("published volume is not accessible at %s (err=%v)", targetPath, err)
 	}
 
-	// Repeating the sequence must converge on the same host state rather than stacking
-	// mounts or reformatting a device that already carries data.
+	// Retries must not stack mounts or reformat.
 	for range 2 {
 		if _, err := client.NodeStageVolume(ctx, stage); err != nil {
 			t.Fatalf("repeated NodeStageVolume failed: %v", err)
@@ -308,12 +321,14 @@ func TestNodeService_RawBlockVolumeLifecycleOnEmulatedHost(t *testing.T) {
 	stage := &csi.NodeStageVolumeRequest{
 		VolumeId:          emulatedVolumeID,
 		StagingTargetPath: stagingPath,
+		PublishContext:    host.publishContext(),
 		VolumeCapability:  blockCapability(),
 	}
 	publish := &csi.NodePublishVolumeRequest{
 		VolumeId:          emulatedVolumeID,
 		StagingTargetPath: stagingPath,
 		TargetPath:        targetPath,
+		PublishContext:    host.publishContext(),
 		VolumeCapability:  blockCapability(),
 	}
 
@@ -351,7 +366,7 @@ func TestNodeService_RawBlockVolumeLifecycleOnEmulatedHost(t *testing.T) {
 	if info, err := os.Stat(targetPath); err != nil || info.IsDir() {
 		t.Errorf("expected a file at the raw block target %s (err=%v)", targetPath, err)
 	}
-	// A raw block volume is handed to the workload exactly as it is.
+	// Raw block must not be formatted.
 	if host.exec.countCalls("mkfs.") != 0 {
 		t.Errorf("a raw block volume must never be formatted, got calls %v", host.exec.calls)
 	}
@@ -420,6 +435,7 @@ func TestNodeService_PublishFailureLeavesNoTargetOnEmulatedHost(t *testing.T) {
 		VolumeId:          "vol-not-attached",
 		StagingTargetPath: filepath.Join(host.dir, "block-staging"),
 		TargetPath:        detachedTarget,
+		PublishContext:    host.publishContext(),
 		VolumeCapability:  blockCapability(),
 	})
 	if status.Code(err) != codes.NotFound {
@@ -447,6 +463,7 @@ func TestNodeService_UnpublishReportsRemainingMountOnEmulatedHost(t *testing.T) 
 	if _, err := client.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
 		VolumeId:          emulatedVolumeID,
 		StagingTargetPath: stagingPath,
+		PublishContext:    host.publishContext(),
 		VolumeCapability:  mountCapability("ext4"),
 	}); err != nil {
 		t.Fatalf("NodeStageVolume failed: %v", err)
@@ -455,12 +472,13 @@ func TestNodeService_UnpublishReportsRemainingMountOnEmulatedHost(t *testing.T) 
 		VolumeId:          emulatedVolumeID,
 		StagingTargetPath: stagingPath,
 		TargetPath:        targetPath,
+		PublishContext:    host.publishContext(),
 		VolumeCapability:  mountCapability("ext4"),
 	}); err != nil {
 		t.Fatalf("NodePublishVolume failed: %v", err)
 	}
 
-	// A target that the host refuses to unmount must not be reported as unpublished.
+	// Failed unmount must leave the mount and return Internal.
 	host.table.UnmountFunc = func(_ string) error {
 		return errors.New("device or resource busy")
 	}
@@ -514,8 +532,7 @@ func TestNodeService_NodeGetInfoReportsNodeIDFromFlags(t *testing.T) {
 		t.Fatalf("NodeGetInfo failed: %v", err)
 	}
 
-	// The compute instance Server UUID the operator passes on the command line is what
-	// the controller later attaches EVS volumes to, so it must be reported unchanged.
+	// NodeId is the --nodeid Server UUID used for attach.
 	if res.GetNodeId() != serverUUID {
 		t.Errorf("expected node_id %q from --nodeid, got %q", serverUUID, res.GetNodeId())
 	}

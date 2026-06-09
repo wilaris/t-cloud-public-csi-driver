@@ -3,6 +3,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -56,10 +57,7 @@ func NewNodeService(mounter mount.Mounter, cfg *config.Config) (*NodeService, er
 }
 
 // NodeGetInfo returns the node ID (compute instance Server UUID) and availability zone topology.
-//
-// The reported zone must be the availability zone the node's EVS volumes are attachable in.
-// A region covers several zones, so reporting one in place of the other would let Kubernetes
-// schedule a workload onto a node that cannot reach its volume.
+// AccessibleTopology zone must match where EVS volumes attach (not the region).
 func (s *NodeService) NodeGetInfo(
 	ctx context.Context,
 	req *csi.NodeGetInfoRequest,
@@ -232,7 +230,7 @@ func (s *NodeService) NodePublishVolume(
 		return nil, err
 	}
 
-	// Reject a writable publish for a read-only mode before touching the host.
+	// Read-only access mode requires Readonly=true.
 	readOnlyMode := req.GetVolumeCapability().GetAccessMode().GetMode() ==
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
 	if readOnlyMode && !req.GetReadonly() {
@@ -245,7 +243,7 @@ func (s *NodeService) NodePublishVolume(
 	stagingPath := req.GetStagingTargetPath()
 	targetPath := req.GetTargetPath()
 
-	// Publishing is always a bind mount; the source is never probed or formatted here.
+	// Publish is bind-only; no format here.
 	mountOptions := []string{"bind"}
 	if req.GetReadonly() {
 		mountOptions = append(mountOptions, "ro")
@@ -361,32 +359,37 @@ func (s *NodeService) NodeUnpublishVolume(
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
-// discoverDevice resolves the block device backing a volume on this node. The device path
-// observed at attach time and passed through the publish context is preferred, with the
-// volume ID as a fallback for a controller that does not report one.
+// discoverDevice requires publish-context devicePath; mounter checks by-id agreement.
 func (s *NodeService) discoverDevice(
 	ctx context.Context,
 	volumeID string,
 	publishContext map[string]string,
 ) (string, error) {
-	identifiers := make([]string, 0, 2)
-	if devicePath := strings.TrimSpace(publishContext[devicePathKey]); devicePath != "" {
-		identifiers = append(identifiers, devicePath)
+	devicePath := strings.TrimSpace(publishContext[devicePathKey])
+	if devicePath == "" {
+		return "", status.Error(
+			codes.InvalidArgument,
+			fmt.Sprintf("publish context for volume %q has no %s", volumeID, devicePathKey),
+		)
 	}
-	identifiers = append(identifiers, volumeID)
 
-	var lastErr error
-	for _, identifier := range identifiers {
-		device, err := s.mounter.DiscoverDevice(ctx, identifier)
-		if err == nil {
-			return device, nil
-		}
-		lastErr = err
+	device, err := s.mounter.DiscoverDevice(ctx, volumeID, devicePath)
+	if err == nil {
+		return device, nil
+	}
+
+	// Map mounter identity errors to gRPC codes.
+	code := codes.NotFound
+	switch {
+	case errors.Is(err, mount.ErrInvalidInput):
+		code = codes.InvalidArgument
+	case errors.Is(err, mount.ErrDeviceIdentityUnverified):
+		code = codes.FailedPrecondition
 	}
 
 	return "", status.Error(
-		codes.NotFound,
-		fmt.Sprintf("failed to discover block device for volume %q: %v", volumeID, lastErr),
+		code,
+		fmt.Sprintf("failed to verify the block device for volume %q: %v", volumeID, err),
 	)
 }
 

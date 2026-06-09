@@ -40,12 +40,19 @@ func TestAttachVolume_Validation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := client.AttachVolume(context.Background(), tc.volumeID, tc.serverID)
+			attachment, err := client.AttachVolume(
+				context.Background(),
+				tc.volumeID,
+				tc.serverID,
+			)
 			if err == nil {
 				t.Fatalf("expected error for %s, got nil", tc.name)
 			}
 			if !errors.Is(err, evs.ErrInvalidArgument) {
 				t.Errorf("expected ErrInvalidArgument, got: %v", err)
+			}
+			if attachment != nil {
+				t.Errorf("expected no attachment alongside the error, got %+v", attachment)
 			}
 		})
 	}

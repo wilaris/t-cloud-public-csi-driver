@@ -103,23 +103,44 @@ func (m *mockEVSClient) DeleteVolume(ctx context.Context, id string) error {
 	return nil
 }
 
-func (m *mockEVSClient) AttachVolume(ctx context.Context, volumeID, serverID string) error {
+func (m *mockEVSClient) AttachVolume(
+	ctx context.Context,
+	volumeID, serverID string,
+) (*evs.Attachment, error) {
 	if volumeID == "" || serverID == "" {
-		return fmt.Errorf("attach volume: %w", evs.ErrInvalidArgument)
+		return nil, fmt.Errorf("attach volume: %w", evs.ErrInvalidArgument)
 	}
 	vol, ok := m.volumes[volumeID]
 	if !ok {
-		return fmt.Errorf("volume %s: %w", volumeID, evs.ErrNotFound)
+		return nil, fmt.Errorf("volume %s: %w", volumeID, evs.ErrNotFound)
 	}
 	if currentServer, attached := m.attachments[volumeID]; attached {
 		if currentServer == serverID {
-			return nil
+			// Idempotent attach returns the same attachment.
+			return m.attachmentOf(volumeID, serverID), nil
 		}
-		return fmt.Errorf("volume %s attached to %s: %w", volumeID, currentServer, evs.ErrConflict)
+		return nil, fmt.Errorf(
+			"volume %s attached to %s: %w",
+			volumeID,
+			currentServer,
+			evs.ErrConflict,
+		)
 	}
 	m.attachments[volumeID] = serverID
 	vol.Status = "in-use"
-	return nil
+	return m.attachmentOf(volumeID, serverID), nil
+}
+
+// mockAttachedDeviceName is the device the mock cloud reports for an attachment.
+const mockAttachedDeviceName = "/dev/vdb"
+
+// attachmentOf builds the descriptor the attachment boundary returns for an attached volume.
+func (m *mockEVSClient) attachmentOf(volumeID, serverID string) *evs.Attachment {
+	return &evs.Attachment{
+		VolumeID:   volumeID,
+		ServerID:   serverID,
+		DeviceName: mockAttachedDeviceName,
+	}
 }
 
 func (m *mockEVSClient) DetachVolume(ctx context.Context, volumeID, serverID string) error {
@@ -216,11 +237,58 @@ func TestControllerPublishVolume_HappyPath(t *testing.T) {
 	if resp == nil {
 		t.Fatal("expected non-nil response")
 	}
+	if got := resp.GetPublishContext()["devicePath"]; got != mockAttachedDeviceName {
+		t.Errorf(
+			"expected publish context devicePath %q, got %q",
+			mockAttachedDeviceName,
+			got,
+		)
+	}
 
 	// Verify volume status in mock
 	updatedVol, _ := client.GetVolume(context.Background(), vol.ID)
 	if updatedVol.Status != "in-use" {
 		t.Errorf("expected volume status in-use, got %s", updatedVol.Status)
+	}
+}
+
+// bareDeviceEVSClient reports a successful attachment whose device name the node cannot use.
+type bareDeviceEVSClient struct {
+	*mockEVSClient
+}
+
+func (c *bareDeviceEVSClient) AttachVolume(
+	ctx context.Context,
+	volumeID, serverID string,
+) (*evs.Attachment, error) {
+	attachment, err := c.mockEVSClient.AttachVolume(ctx, volumeID, serverID)
+	if err != nil {
+		return nil, err
+	}
+	attachment.DeviceName = "vdb"
+	return attachment, nil
+}
+
+func TestControllerPublishVolume_UnusableDevicePath(t *testing.T) {
+	t.Parallel()
+
+	client := newMockEVSClient()
+	svc, _ := driver.NewControllerService(&bareDeviceEVSClient{client}, validTestConfig())
+
+	vol, _ := client.CreateVolume(context.Background(), evs.CreateVolumeOpts{
+		Name:             "bare-device-vol",
+		Size:             1,
+		AvailabilityZone: "eu-de-01",
+		VolumeType:       "SSD",
+	})
+
+	_, err := svc.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+		VolumeId:         vol.ID,
+		NodeId:           "server-uuid-1234",
+		VolumeCapability: accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+	})
+	if status.Code(err) != codes.Internal {
+		t.Errorf("expected Internal for an unusable attachment device path, got: %v", err)
 	}
 }
 
@@ -334,7 +402,7 @@ func TestControllerUnpublishVolume_HappyPath(t *testing.T) {
 		VolumeType:       "SSD",
 	})
 
-	_ = client.AttachVolume(context.Background(), vol.ID, "server-uuid-1234")
+	_, _ = client.AttachVolume(context.Background(), vol.ID, "server-uuid-1234")
 
 	req := &csi.ControllerUnpublishVolumeRequest{
 		VolumeId: vol.ID,
@@ -888,8 +956,7 @@ func requisiteZone(zone string) *csi.TopologyRequirement {
 }
 
 // TestCreateVolume_AcceptsOnlyTheDeclaredParameters fixes the accepted StorageClass parameter set.
-// The container orchestrator owns its own key namespace, so those keys are ignored rather than
-// refused, and every other key is refused before any cloud effect.
+// CO-reserved keys are ignored; other unknown keys are rejected before EVS calls.
 func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 	t.Parallel()
 
@@ -933,25 +1000,25 @@ func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 			wantZone: "eu-de-01",
 		},
 		{
-			name:       "absent type is refused",
+			name:       "absent type is rejected",
 			parameters: map[string]string{"availability_zone": "eu-de-01"},
 			topology:   requisiteZone("eu-de-01"),
 			wantCode:   codes.InvalidArgument,
 		},
 		{
-			name:       "nil parameters are refused",
+			name:       "nil parameters are rejected",
 			parameters: nil,
 			topology:   requisiteZone("eu-de-01"),
 			wantCode:   codes.InvalidArgument,
 		},
 		{
-			name:       "blank type is refused",
+			name:       "blank type is rejected",
 			parameters: map[string]string{"type": "   "},
 			topology:   requisiteZone("eu-de-01"),
 			wantCode:   codes.InvalidArgument,
 		},
 		{
-			name: "withdrawn volume_type alias is refused",
+			name: "withdrawn volume_type alias is rejected",
 			parameters: map[string]string{
 				"type":        "SSD",
 				"volume_type": "SSD",
@@ -960,7 +1027,7 @@ func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 			wantCode: codes.InvalidArgument,
 		},
 		{
-			name: "withdrawn zone alias is refused",
+			name: "withdrawn zone alias is rejected",
 			parameters: map[string]string{
 				"type": "SSD",
 				"zone": "eu-de-01",
@@ -969,7 +1036,7 @@ func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 			wantCode: codes.InvalidArgument,
 		},
 		{
-			name: "any other key is refused",
+			name: "any other key is rejected",
 			parameters: map[string]string{
 				"type":   "SSD",
 				"fsType": "ext4",
@@ -1005,7 +1072,7 @@ func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 			}
 			if tt.wantCode != codes.OK {
 				if len(client.volumes) != 0 {
-					t.Errorf("a refused request created %d volumes, want 0", len(client.volumes))
+					t.Errorf("a rejected request created %d volumes, want 0", len(client.volumes))
 				}
 				return
 			}
@@ -1028,8 +1095,7 @@ func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 	}
 }
 
-// TestCreateVolume_RejectsAVolumeContentSource proves provisioning from a snapshot or an existing
-// volume is refused, because neither capability is advertised.
+// TestCreateVolume_RejectsAVolumeContentSource: CreateVolume rejects VolumeContentSource (not advertised).
 func TestCreateVolume_RejectsAVolumeContentSource(t *testing.T) {
 	t.Parallel()
 
@@ -1084,15 +1150,13 @@ func TestCreateVolume_RejectsAVolumeContentSource(t *testing.T) {
 				)
 			}
 			if len(client.volumes) != 0 {
-				t.Errorf("a refused request created %d volumes, want 0", len(client.volumes))
+				t.Errorf("a rejected request created %d volumes, want 0", len(client.volumes))
 			}
 		})
 	}
 }
 
-// TestCreateVolume_ResolvesRequestedCapacity fixes the resolved EVS size. An omitted or smaller
-// requested capacity resolves to the declared minimum data-volume size, a partial GiB rounds up, and
-// no requested size is capped.
+// TestCreateVolume_ResolvesRequestedCapacity: min 10GiB, round up partial GiB, no artificial max.
 func TestCreateVolume_ResolvesRequestedCapacity(t *testing.T) {
 	t.Parallel()
 
@@ -1150,7 +1214,7 @@ func TestCreateVolume_ResolvesRequestedCapacity(t *testing.T) {
 			wantSizeGiB: 32768,
 		},
 		{
-			name: "satisfiable limit is honoured",
+			name: "satisfiable limit is honored",
 			capacity: &csi.CapacityRange{
 				RequiredBytes: 15 * gib,
 				LimitBytes:    20 * gib,
@@ -1198,9 +1262,8 @@ func TestCreateVolume_ResolvesRequestedCapacity(t *testing.T) {
 	}
 }
 
-// TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity proves a malformed capacity range
-// is refused as caller input while a well-formed range no supported size can satisfy receives the
-// CSI-prescribed out-of-range status, so a caller can tell the two apart.
+// TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity:
+// InvalidArgument for bad ranges; OutOfRange when no size fits the limit.
 func TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity(t *testing.T) {
 	t.Parallel()
 
@@ -1278,15 +1341,13 @@ func TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity(t *testing
 				)
 			}
 			if len(client.volumes) != 0 {
-				t.Errorf("a refused request created %d volumes, want 0", len(client.volumes))
+				t.Errorf("a rejected request created %d volumes, want 0", len(client.volumes))
 			}
 		})
 	}
 }
 
-// TestCreateVolume_ReflectsNoParameterIntoTheResponse proves the volume context stays empty and no
-// operator-supplied parameter is echoed to the caller, so no consumer can begin depending on
-// parameter reflection.
+// TestCreateVolume_ReflectsNoParameterIntoTheResponse: empty volume context and no content source.
 func TestCreateVolume_ReflectsNoParameterIntoTheResponse(t *testing.T) {
 	t.Parallel()
 

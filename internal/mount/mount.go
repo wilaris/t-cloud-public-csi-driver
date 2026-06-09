@@ -18,6 +18,8 @@ var (
 	ErrInvalidInput = errors.New("invalid input")
 	// ErrDeviceNotFound indicates the target block device could not be discovered.
 	ErrDeviceNotFound = errors.New("device not found")
+	// ErrDeviceIdentityUnverified: by-id and published path disagree.
+	ErrDeviceIdentityUnverified = errors.New("device identity not verified")
 	// ErrUnsupportedFilesystem indicates an unsupported filesystem requested for formatting/mounting.
 	ErrUnsupportedFilesystem = errors.New("unsupported filesystem type")
 	// ErrMountFailed indicates a failure during mount execution.
@@ -35,8 +37,8 @@ var (
 const (
 	// DefaultFilesystemType is the filesystem used when a caller does not request one.
 	DefaultFilesystemType = "ext4"
-	// blkidNoFilesystem is the blkid exit status reported when a device carries no
-	// filesystem, or when the requested token was not found.
+	// blkidNoFilesystem is the blkid exit status when a device has no filesystem
+	// or the requested token was not found.
 	blkidNoFilesystem = 2
 	// virtioSerialMaxLen is the byte length of the VirtIO serial field. udev truncates
 	// longer volume identifiers when it creates /dev/disk/by-id/virtio-* links.
@@ -45,8 +47,7 @@ const (
 	mountPathPerm = 0o750
 )
 
-// IsSupportedFilesystemType reports whether fsType is a filesystem we format and mount
-// (case-insensitive). Empty is unsupported; callers substitute DefaultFilesystemType first.
+// IsSupportedFilesystemType is true for ext4 and xfs (case-insensitive).
 func IsSupportedFilesystemType(fsType string) bool {
 	switch strings.ToLower(fsType) {
 	case "ext4", "xfs":
@@ -58,7 +59,7 @@ func IsSupportedFilesystemType(fsType string) bool {
 
 // Mounter defines host block device discovery, formatting, mounting, and unmounting operations.
 type Mounter interface {
-	DiscoverDevice(ctx context.Context, deviceIdentifier string) (string, error)
+	DiscoverDevice(ctx context.Context, volumeID, publishedDevicePath string) (string, error)
 	FormatAndMount(
 		ctx context.Context,
 		source string,
@@ -84,6 +85,7 @@ type LinuxMounter struct {
 	mounter     mountutils.Interface
 	exec        k8sexec.Interface
 	safeMounter *mountutils.SafeFormatAndMount
+	devDir      string
 	diskByIDDir string
 }
 
@@ -113,6 +115,13 @@ func WithDiskByIDDir(dir string) MounterOption {
 	}
 }
 
+// WithDevDir overrides the default /dev directory that a published device path must stay inside.
+func WithDevDir(dir string) MounterOption {
+	return func(m *LinuxMounter) {
+		m.devDir = dir
+	}
+}
+
 // NewLinuxMounter creates a new LinuxMounter instance backed by k8s.io/mount-utils.
 func NewLinuxMounter(opts ...MounterOption) *LinuxMounter {
 	mounter := mountutils.New("")
@@ -126,6 +135,7 @@ func NewLinuxMounter(opts ...MounterOption) *LinuxMounter {
 		mounter:     mounter,
 		exec:        exec,
 		safeMounter: safeMounter,
+		devDir:      "/dev",
 		diskByIDDir: "/dev/disk/by-id",
 	}
 
@@ -136,69 +146,106 @@ func NewLinuxMounter(opts ...MounterOption) *LinuxMounter {
 	return m
 }
 
-// DiscoverDevice resolves a volume ID or device name to an absolute block device path.
+// DiscoverDevice resolves the block device for volumeID on this node.
+// publishedDevicePath is the attach-time path from the cloud. A by-id link for the volume ID
+// and that path must resolve to the same kernel device (virtio serials may be truncated).
 func (m *LinuxMounter) DiscoverDevice(
 	ctx context.Context,
-	deviceIdentifier string,
+	volumeID, publishedDevicePath string,
 ) (string, error) {
-	if deviceIdentifier == "" {
-		return "", fmt.Errorf("%w: device identifier is empty", ErrInvalidInput)
+	if volumeID == "" {
+		return "", fmt.Errorf("%w: volume identifier is empty", ErrInvalidInput)
+	}
+	if publishedDevicePath == "" {
+		return "", fmt.Errorf("%w: published device path is empty", ErrInvalidInput)
 	}
 	if err := ctx.Err(); err != nil {
-		return "", fmt.Errorf("discover device %s: %w", deviceIdentifier, err)
+		return "", fmt.Errorf("discover device for volume %s: %w", volumeID, err)
 	}
-
-	// If already absolute path, verify existence
-	if strings.HasPrefix(deviceIdentifier, "/") {
-		if _, err := os.Stat(deviceIdentifier); err == nil {
-			return resolveSymlink(deviceIdentifier), nil
-		}
-	}
-
-	for _, cand := range m.deviceCandidates(deviceIdentifier) {
-		if _, err := os.Stat(cand); err == nil {
-			return resolveSymlink(cand), nil
-		}
-	}
-
-	return "", fmt.Errorf(
-		"%w: volume %s not found in %s or /dev",
-		ErrDeviceNotFound,
-		deviceIdentifier,
-		m.diskByIDDir,
-	)
-}
-
-// deviceCandidates returns the paths that may expose deviceIdentifier, most specific first.
-//
-// A VirtIO serial holds at most virtioSerialMaxLen bytes, so udev truncates a 36-character
-// EVS volume UUID when it creates the /dev/disk/by-id/virtio-<serial> link. The truncated
-// identifier is therefore tried alongside the full one.
-func (m *LinuxMounter) deviceCandidates(deviceIdentifier string) []string {
-	identifiers := []string{deviceIdentifier}
-	if len(deviceIdentifier) > virtioSerialMaxLen {
-		identifiers = append(identifiers, deviceIdentifier[:virtioSerialMaxLen])
-	}
-
-	candidates := make([]string, 0, len(identifiers)*4+1)
-	for _, identifier := range identifiers {
-		candidates = append(
-			candidates,
-			filepath.Join(m.diskByIDDir, identifier),
-			filepath.Join(m.diskByIDDir, "virtio-"+identifier),
-			filepath.Join(m.diskByIDDir, "nvme-"+identifier),
-			filepath.Join(m.diskByIDDir, "scsi-"+identifier),
+	if !m.holdsDevice(publishedDevicePath) {
+		return "", fmt.Errorf(
+			"%w: published device path %s is not a device in %s",
+			ErrInvalidInput,
+			publishedDevicePath,
+			m.devDir,
 		)
 	}
 
-	// A stable by-id link is preferred over a kernel device name, so /dev is checked last.
-	return append(candidates, filepath.Join("/dev", deviceIdentifier))
+	if _, err := os.Stat(publishedDevicePath); err != nil {
+		return "", fmt.Errorf(
+			"%w: published device path %s is not present on this node",
+			ErrDeviceNotFound,
+			publishedDevicePath,
+		)
+	}
+	published := resolveSymlink(publishedDevicePath)
+
+	links := m.serialLinks(volumeID)
+	if len(links) == 0 {
+		return "", fmt.Errorf(
+			"%w: no %s link identifies volume %s",
+			ErrDeviceNotFound,
+			m.diskByIDDir,
+			volumeID,
+		)
+	}
+
+	// All volume serial links must resolve to the published device.
+	for _, link := range links {
+		if resolveSymlink(link) != published {
+			return "", fmt.Errorf(
+				"%w: %s and published device path %s name different devices",
+				ErrDeviceIdentityUnverified,
+				link,
+				publishedDevicePath,
+			)
+		}
+	}
+
+	return published, nil
 }
 
-// GetFilesystemType inspects existing filesystem on source block device using blkid or lsblk.
-//
-// "" with a nil error means no filesystem. An undetectable filesystem is an error, never "",
-// so an unreadable device can't be mistaken for an unformatted one and overwritten.
+// holdsDevice is true for absolute paths under the node device dir.
+func (m *LinuxMounter) holdsDevice(path string) bool {
+	if !filepath.IsAbs(path) {
+		return false
+	}
+
+	rel, err := filepath.Rel(m.devDir, filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// serialLinks returns the existing by-id links that claim volumeID, by its complete serial and by
+// the serial udev truncates to the VirtIO serial field length.
+func (m *LinuxMounter) serialLinks(volumeID string) []string {
+	serials := []string{volumeID}
+	if len(volumeID) > virtioSerialMaxLen {
+		serials = append(serials, volumeID[:virtioSerialMaxLen])
+	}
+
+	links := make([]string, 0, len(serials))
+	for _, serial := range serials {
+		for _, name := range []string{
+			serial,
+			"virtio-" + serial,
+			"nvme-" + serial,
+			"scsi-" + serial,
+		} {
+			link := filepath.Join(m.diskByIDDir, name)
+			if _, err := os.Stat(link); err == nil {
+				links = append(links, link)
+			}
+		}
+	}
+
+	return links
+}
+
+// GetFilesystemType inspects the filesystem on source via blkid or lsblk.
+// Empty string + nil err means unformatted; detection failure is an error.
 func (m *LinuxMounter) GetFilesystemType(ctx context.Context, source string) (string, error) {
 	if source == "" {
 		return "", fmt.Errorf("%w: source path is empty", ErrInvalidInput)
@@ -230,11 +277,7 @@ func (m *LinuxMounter) GetFilesystemType(ctx context.Context, source string) (st
 	)
 }
 
-// FormatAndMount formats an unformatted block device and mounts it to target.
-//
-// source must be a block device. It must not be used to bind mount an already mounted
-// directory or to publish a raw block volume, because an unformatted source is formatted;
-// use Mount for those.
+// FormatAndMount formats if needed then mounts a block device (not for bind/raw publish).
 func (m *LinuxMounter) FormatAndMount(
 	ctx context.Context,
 	source string,
@@ -304,12 +347,8 @@ func (m *LinuxMounter) FormatAndMount(
 	return nil
 }
 
-// Mount attaches source at target without inspecting or altering source.
-//
-// This is the operation required for bind mounts, where source is either an already staged
-// directory or a raw block device that must be published exactly as it is. target must
-// already exist, and must be a directory for a filesystem mount or a file for a raw block
-// device. Mounting an already mounted target succeeds without remounting.
+// Mount does not inspect or format source (bind mounts, raw block).
+// target must already exist. Already-mounted target succeeds without remounting.
 func (m *LinuxMounter) Mount(
 	ctx context.Context,
 	source string,
@@ -366,12 +405,9 @@ func (m *LinuxMounter) Unmount(ctx context.Context, target string) error {
 	return nil
 }
 
-// IsMountPoint checks if target path is a mount point.
-//
-// It consults the kernel mount table rather than comparing device numbers, so bind mounts
-// and mounts that share a device with their parent directory are reported correctly. A path
-// that does not exist is not a mount point. A corrupted mount is reported as mounted, so
-// that callers can still unmount it.
+// IsMountPoint checks if target is a mount point.
+// Uses the mount table so bind mounts are detected correctly. Missing path is not mounted;
+// corrupted mounts report as mounted so callers can unmount them.
 func (m *LinuxMounter) IsMountPoint(ctx context.Context, target string) (bool, error) {
 	if target == "" {
 		return false, fmt.Errorf("%w: target path is empty", ErrInvalidInput)

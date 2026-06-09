@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -28,12 +29,13 @@ const (
 	// coReservedParameterPrefix is the StorageClass parameter namespace owned by the container
 	// orchestrator.
 	coReservedParameterPrefix = "csi.storage.k8s.io/"
-	// minVolumeSizeGiB is the declared EVS minimum data-volume size. It resolves an omitted or
-	// smaller requested capacity; it is never a lower-bound check, so a request is refused only
-	// when the resolved size exceeds limit_bytes.
+	// minVolumeSizeGiB is the EVS minimum; smaller or omitted capacity becomes this size.
 	minVolumeSizeGiB = 10
 	// bytesInGiB is the number of bytes in one GiB.
 	bytesInGiB = 1024 * 1024 * 1024
+	// devDirPrefix is the host device directory a published device path must name. The controller
+	// only checks path shape; node resolves the device.
+	devDirPrefix = "/dev/"
 )
 
 // EVSClient defines the subset of EVS operations required by the CSI Controller service.
@@ -42,7 +44,7 @@ type EVSClient interface {
 	GetVolume(ctx context.Context, id string) (*evs.Volume, error)
 	DiscoverVolume(ctx context.Context, opts evs.DiscoverVolumeOpts) (*evs.Volume, error)
 	DeleteVolume(ctx context.Context, id string) error
-	AttachVolume(ctx context.Context, volumeID, serverID string) error
+	AttachVolume(ctx context.Context, volumeID, serverID string) (*evs.Attachment, error)
 	DetachVolume(ctx context.Context, volumeID, serverID string) error
 }
 
@@ -115,8 +117,7 @@ func (s *ControllerService) ControllerPublishVolume(
 		return nil, err
 	}
 
-	// EVS attachments have no read-only form and we don't advertise PUBLISH_READONLY,
-	// so reject instead of silently attaching read-write.
+	// EVS has no read-only attach and we don't advertise PUBLISH_READONLY.
 	if req.GetReadonly() {
 		return nil, status.Error(
 			codes.InvalidArgument,
@@ -124,7 +125,7 @@ func (s *ControllerService) ControllerPublishVolume(
 		)
 	}
 
-	err := s.evsClient.AttachVolume(ctx, req.GetVolumeId(), req.GetNodeId())
+	attachment, err := s.evsClient.AttachVolume(ctx, req.GetVolumeId(), req.GetNodeId())
 	if err != nil {
 		return nil, toGRPCError(
 			fmt.Sprintf("publish volume %q to node %q", req.GetVolumeId(), req.GetNodeId()),
@@ -133,8 +134,20 @@ func (s *ControllerService) ControllerPublishVolume(
 		)
 	}
 
+	// Attach must return a usable device path for the node.
+	if attachment == nil || !isDeviceNodePath(attachment.DeviceName) {
+		return nil, status.Error(
+			codes.Internal,
+			fmt.Sprintf(
+				"volume %q was attached to node %q without a usable device path",
+				req.GetVolumeId(),
+				req.GetNodeId(),
+			),
+		)
+	}
+
 	return &csi.ControllerPublishVolumeResponse{
-		PublishContext: map[string]string{},
+		PublishContext: map[string]string{devicePathKey: attachment.DeviceName},
 	}, nil
 }
 
@@ -263,12 +276,12 @@ func (s *ControllerService) DeleteVolume(
 		if errors.Is(err, evs.ErrNotFound) {
 			return &csi.DeleteVolumeResponse{}, nil
 		}
-		// Refusing to delete a volume we don't own is expected, not an internal error — map it explicitly.
+		// Map missing ownership to FailedPrecondition (not Internal).
 		if errors.Is(err, evs.ErrNotOwned) {
 			return nil, status.Error(
 				codes.FailedPrecondition,
 				fmt.Sprintf(
-					"delete volume %q: volume carries no ownership marker for this driver",
+					"delete volume %q: volume has no ownership marker for this driver",
 					req.GetVolumeId(),
 				),
 			)
@@ -322,7 +335,7 @@ func (s *ControllerService) ValidateVolumeCapabilities(
 		}
 	}
 
-	// We provision with an empty volume context, so a non-empty one means the volume isn't ours.
+	// Non-empty volume context is unsupported (we provision empty).
 	if len(req.GetVolumeContext()) > 0 {
 		return &csi.ValidateVolumeCapabilitiesResponse{
 			Confirmed: nil,
@@ -347,9 +360,8 @@ func (s *ControllerService) ValidateVolumeCapabilities(
 	}, nil
 }
 
-// validateVolumeCapability rejects unsupported access modes and filesystems before any cloud
-// or host side effects. SINGLE_NODE_SINGLE_WRITER and SINGLE_NODE_MULTI_WRITER are rejected
-// because the CSI spec gates them behind a Node capability we don't advertise.
+// validateVolumeCapability rejects unsupported access modes and filesystems before cloud or
+// host side effects. Reject modes gated on Node caps we don't advertise.
 func validateVolumeCapability(cap *csi.VolumeCapability) error {
 	if cap == nil {
 		return status.Error(codes.InvalidArgument, "volume capability cannot be nil")
@@ -372,8 +384,7 @@ func validateVolumeCapability(cap *csi.VolumeCapability) error {
 		)
 	}
 
-	// Raw block access carries no filesystem and is never formatted, so only a mounted capability has
-	// a filesystem to check. An omitted name resolves to the default at staging time.
+	// Only mount capabilities have an fs type to validate. Omitted name defaults at staging.
 	fsType := strings.TrimSpace(cap.GetMount().GetFsType())
 	if fsType != "" && !mount.IsSupportedFilesystemType(fsType) {
 		return status.Error(
@@ -385,8 +396,7 @@ func validateVolumeCapability(cap *csi.VolumeCapability) error {
 	return nil
 }
 
-// validateParameters rejects StorageClass parameter keys the driver does not accept. Keys reserved
-// for the container orchestrator are ignored, because the CO owns that namespace.
+// validateParameters allows type, availability_zone, and csi.storage.k8s.io/* keys.
 func validateParameters(params map[string]string) error {
 	for _, key := range slices.Sorted(maps.Keys(params)) {
 		switch {
@@ -405,9 +415,7 @@ func validateParameters(params map[string]string) error {
 	return nil
 }
 
-// resolveSizeGiB resolves a CSI capacity range to a whole-GiB EVS volume size. An omitted range or a
-// required size below the declared EVS minimum resolves to that minimum. A present required size is
-// rounded up to whole GiB and never capped, leaving every upper bound to EVS.
+// resolveSizeGiB maps CapacityRange to whole GiB (min minVolumeSizeGiB, round up).
 func resolveSizeGiB(capRange *csi.CapacityRange) (int, error) {
 	reqBytes := capRange.GetRequiredBytes()
 	limitBytes := capRange.GetLimitBytes()
@@ -493,10 +501,17 @@ func formatCreateVolumeResponse(vol *evs.Volume) *csi.CreateVolumeResponse {
 	}
 }
 
+// isDeviceNodePath reports an absolute clean path under /dev/.
+func isDeviceNodePath(path string) bool {
+	if !strings.HasPrefix(path, devDirPrefix) {
+		return false
+	}
+	name := strings.TrimPrefix(path, devDirPrefix)
+	return name != "" && filepath.Clean(path) == path
+}
+
 // toGRPCError converts package domain errors into canonical gRPC status errors.
-//
-// conflictCode is the code CSI assigns to a conflict for this operation; it differs per
-// operation and sidecars branch on it, so the caller passes it in.
+// conflictCode is operation-specific (CSI sidecars branch on it).
 func toGRPCError(op string, conflictCode codes.Code, err error) error {
 	if err == nil {
 		return nil

@@ -16,21 +16,43 @@ const (
 	attachmentPollInterval = time.Second
 )
 
-// AttachVolume attaches an EVS volume to the compute instance identified by serverID.
-func (c *Client) AttachVolume(ctx context.Context, volumeID, serverID string) error {
+// Attachment describes one observed attachment of an EVS volume to a compute instance.
+// DeviceName is required; the node cannot find the device without it.
+type Attachment struct {
+	VolumeID   string
+	ServerID   string
+	DeviceName string
+}
+
+// AttachVolume attaches volumeID to serverID and returns the attachment (incl. already attached).
+func (c *Client) AttachVolume(
+	ctx context.Context,
+	volumeID, serverID string,
+) (*Attachment, error) {
 	if err := c.validateAttachmentInput(volumeID, serverID); err != nil {
-		return fmt.Errorf("attach volume %s to server %s: %w", volumeID, serverID, err)
+		return nil, fmt.Errorf("attach volume %s to server %s: %w", volumeID, serverID, err)
 	}
 
-	attached, err := c.attachmentExists(ctx, volumeID, serverID)
+	existing, err := c.observeAttachment(ctx, volumeID, serverID)
 	if err != nil {
-		return c.classifyError(
+		return nil, c.classifyError(
 			fmt.Sprintf("attach volume %s to server %s", volumeID, serverID),
 			err,
 		)
 	}
-	if attached {
-		return nil
+	if attachedWithDevice(existing) {
+		return existing, nil
+	}
+	if existing != nil {
+		// Attached but device name not ready yet; wait for it.
+		attached, err := c.waitForAttachmentState(ctx, volumeID, serverID, attachedWithDevice)
+		if err != nil {
+			return nil, c.classifyError(
+				fmt.Sprintf("attach volume %s to server %s", volumeID, serverID),
+				err,
+			)
+		}
+		return attached, nil
 	}
 
 	job, err := disk.Attach(c.ecsClient, disk.CreateOpts{
@@ -42,26 +64,27 @@ func (c *Client) AttachVolume(ctx context.Context, volumeID, serverID string) er
 	if err != nil {
 		kind := classifyErrorKind(err)
 		if errors.Is(kind, ErrUnavailable) || errors.Is(kind, ErrOperationFailed) {
-			observeErr := c.waitForAttachmentState(
+			attached, observeErr := c.waitForAttachmentState(
 				ctx,
 				volumeID,
 				serverID,
-				true,
+				attachedWithDevice,
 			)
 			if observeErr == nil {
-				return nil
+				return attached, nil
 			}
 		}
-		return c.classifyError(
+		return nil, c.classifyError(
 			fmt.Sprintf("attach volume %s to server %s", volumeID, serverID),
 			err,
 		)
 	}
 	if job == nil || strings.TrimSpace(job.JobID) == "" {
-		if err := c.waitForAttachmentState(ctx, volumeID, serverID, true); err == nil {
-			return nil
+		attached, err := c.waitForAttachmentState(ctx, volumeID, serverID, attachedWithDevice)
+		if err == nil {
+			return attached, nil
 		}
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"attach volume %s to server %s: %w",
 			volumeID,
 			serverID,
@@ -70,19 +93,20 @@ func (c *Client) AttachVolume(ctx context.Context, volumeID, serverID string) er
 	}
 
 	if err := c.waitForAttachmentJob(ctx, job.JobID); err != nil {
-		return c.classifyError(
+		return nil, c.classifyError(
 			fmt.Sprintf("attach volume %s to server %s", volumeID, serverID),
 			err,
 		)
 	}
-	if err := c.waitForAttachmentState(ctx, volumeID, serverID, true); err != nil {
-		return c.classifyError(
+	attached, err := c.waitForAttachmentState(ctx, volumeID, serverID, attachedWithDevice)
+	if err != nil {
+		return nil, c.classifyError(
 			fmt.Sprintf("attach volume %s to server %s", volumeID, serverID),
 			err,
 		)
 	}
 
-	return nil
+	return attached, nil
 }
 
 // DetachVolume detaches an EVS volume from the compute instance identified by serverID.
@@ -91,14 +115,14 @@ func (c *Client) DetachVolume(ctx context.Context, volumeID, serverID string) er
 		return fmt.Errorf("detach volume %s from server %s: %w", volumeID, serverID, err)
 	}
 
-	attached, err := c.attachmentExists(ctx, volumeID, serverID)
+	existing, err := c.observeAttachment(ctx, volumeID, serverID)
 	if err != nil {
 		return c.classifyError(
 			fmt.Sprintf("detach volume %s from server %s", volumeID, serverID),
 			err,
 		)
 	}
-	if !attached {
+	if detached(existing) {
 		return nil
 	}
 
@@ -106,11 +130,11 @@ func (c *Client) DetachVolume(ctx context.Context, volumeID, serverID string) er
 	if err != nil {
 		kind := classifyErrorKind(err)
 		if errors.Is(kind, ErrUnavailable) || errors.Is(kind, ErrOperationFailed) {
-			observeErr := c.waitForAttachmentState(
+			_, observeErr := c.waitForAttachmentState(
 				ctx,
 				volumeID,
 				serverID,
-				false,
+				detached,
 			)
 			if observeErr == nil {
 				return nil
@@ -122,7 +146,7 @@ func (c *Client) DetachVolume(ctx context.Context, volumeID, serverID string) er
 		)
 	}
 	if job == nil || strings.TrimSpace(job.JobID) == "" {
-		if err := c.waitForAttachmentState(ctx, volumeID, serverID, false); err == nil {
+		if _, err := c.waitForAttachmentState(ctx, volumeID, serverID, detached); err == nil {
 			return nil
 		}
 		return fmt.Errorf(
@@ -139,7 +163,7 @@ func (c *Client) DetachVolume(ctx context.Context, volumeID, serverID string) er
 			err,
 		)
 	}
-	if err := c.waitForAttachmentState(ctx, volumeID, serverID, false); err != nil {
+	if _, err := c.waitForAttachmentState(ctx, volumeID, serverID, detached); err != nil {
 		return c.classifyError(
 			fmt.Sprintf("detach volume %s from server %s", volumeID, serverID),
 			err,
@@ -147,6 +171,16 @@ func (c *Client) DetachVolume(ctx context.Context, volumeID, serverID string) er
 	}
 
 	return nil
+}
+
+// attachedWithDevice is true when DeviceName is set.
+func attachedWithDevice(attachment *Attachment) bool {
+	return attachment != nil && attachment.DeviceName != ""
+}
+
+// detached reports whether an observation shows the volume is no longer attached to the server.
+func detached(attachment *Attachment) bool {
+	return attachment == nil
 }
 
 // validateAttachmentInput verifies volumeID and serverID parameters are non-empty strings.
@@ -157,28 +191,32 @@ func (c *Client) validateAttachmentInput(volumeID, serverID string) error {
 	return nil
 }
 
-// attachmentExists checks whether the specified volume is attached to serverID.
-func (c *Client) attachmentExists(
+// observeAttachment reads current attachment from ECS (nil if not attached).
+func (c *Client) observeAttachment(
 	ctx context.Context,
 	volumeID, serverID string,
-) (bool, error) {
+) (*Attachment, error) {
 	if ctx.Err() != nil {
-		return false, ctx.Err()
+		return nil, ctx.Err()
 	}
 	attachments, err := disk.GetAttachments(c.ecsClient, serverID)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if attachments == nil {
-		return false, nil
+		return nil, nil
 	}
 
 	for _, attachment := range attachments.VolumeAttachments {
 		if attachment.VolumeID == volumeID && attachment.ServerID == serverID {
-			return true, nil
+			return &Attachment{
+				VolumeID:   attachment.VolumeID,
+				ServerID:   attachment.ServerID,
+				DeviceName: strings.TrimSpace(attachment.Device),
+			}, nil
 		}
 	}
-	return false, nil
+	return nil, nil
 }
 
 // waitForAttachmentJob polls an asynchronous attachment ECS job until completion using cloudservers.WaitForJobSuccess.
@@ -206,31 +244,32 @@ func (c *Client) waitForAttachmentJob(
 	return nil
 }
 
-// waitForAttachmentState polls attachment status until the volume matches wantAttached state or context expires.
+// waitForAttachmentState polls attachment status until settled accepts the observation, returning
+// that observation, or until the context expires.
 func (c *Client) waitForAttachmentState(
 	ctx context.Context,
 	volumeID, serverID string,
-	wantAttached bool,
-) error {
+	settled func(*Attachment) bool,
+) (*Attachment, error) {
 	ticker := time.NewTicker(attachmentPollInterval)
 	defer ticker.Stop()
 
 	for {
-		attached, err := c.attachmentExists(ctx, volumeID, serverID)
-		if err == nil && attached == wantAttached {
-			return nil
+		attachment, err := c.observeAttachment(ctx, volumeID, serverID)
+		if err == nil && settled(attachment) {
+			return attachment, nil
 		}
 
 		if err != nil {
 			kind := classifyErrorKind(err)
 			if !errors.Is(kind, ErrUnavailable) && !errors.Is(kind, ErrOperationFailed) {
-				return err
+				return nil, err
 			}
 		}
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		case <-ticker.C:
 		}
 	}
