@@ -42,7 +42,7 @@ func (m *mockEVSClient) CreateVolume(
 		Size:             opts.Size,
 		AvailabilityZone: opts.AvailabilityZone,
 		VolumeType:       opts.VolumeType,
-		Metadata:         opts.Metadata,
+		Tags:             map[string]string{evs.OwnershipTagKey: evs.OwnershipTagValue},
 	}
 	m.volumes[vol.ID] = vol
 	return vol, nil
@@ -56,26 +56,47 @@ func (m *mockEVSClient) GetVolume(ctx context.Context, id string) (*evs.Volume, 
 	return vol, nil
 }
 
-func (m *mockEVSClient) ListVolumes(
+func (m *mockEVSClient) DiscoverVolume(
 	ctx context.Context,
-	opts evs.ListVolumeOpts,
-) ([]evs.Volume, error) {
-	var res []evs.Volume
+	opts evs.DiscoverVolumeOpts,
+) (*evs.Volume, error) {
+	nameExists := false
 	for _, vol := range m.volumes {
-		if opts.Name != "" && vol.Name != opts.Name {
+		if vol.Name != opts.Name {
 			continue
 		}
-		if opts.ID != "" && vol.ID != opts.ID {
+		nameExists = true
+		if vol.Tags[evs.OwnershipTagKey] != evs.OwnershipTagValue {
 			continue
 		}
-		res = append(res, *vol)
+		if vol.Status != "available" && vol.Status != "in-use" {
+			continue
+		}
+		if vol.AvailabilityZone != opts.AvailabilityZone || vol.VolumeType != opts.VolumeType {
+			continue
+		}
+		if vol.Size < opts.MinSizeGiB {
+			continue
+		}
+		if opts.MaxSizeGiB > 0 && vol.Size > opts.MaxSizeGiB {
+			continue
+		}
+		return vol, nil
 	}
-	return res, nil
+
+	if nameExists {
+		return nil, fmt.Errorf("volume %s: %w", opts.Name, evs.ErrConflict)
+	}
+	return nil, fmt.Errorf("volume %s: %w", opts.Name, evs.ErrNotFound)
 }
 
 func (m *mockEVSClient) DeleteVolume(ctx context.Context, id string) error {
-	if _, ok := m.volumes[id]; !ok {
+	vol, ok := m.volumes[id]
+	if !ok {
 		return fmt.Errorf("volume %s: %w", id, evs.ErrNotFound)
+	}
+	if vol.Tags[evs.OwnershipTagKey] != evs.OwnershipTagValue {
+		return fmt.Errorf("volume %s: %w", id, evs.ErrNotOwned)
 	}
 	delete(m.volumes, id)
 	delete(m.attachments, id)
@@ -381,6 +402,9 @@ func TestCreateVolume_HappyPath(t *testing.T) {
 		VolumeCapabilities: []*csi.VolumeCapability{
 			mountCapability(""),
 		},
+		Parameters: map[string]string{
+			"type": "SSD",
+		},
 		AccessibilityRequirements: &csi.TopologyRequirement{
 			Requisite: []*csi.Topology{
 				{
@@ -476,6 +500,9 @@ func TestCreateVolume_TopologyRoundTrip(t *testing.T) {
 		VolumeCapabilities: []*csi.VolumeCapability{
 			mountCapability(""),
 		},
+		Parameters: map[string]string{
+			"type": "SSD",
+		},
 		AccessibilityRequirements: &csi.TopologyRequirement{
 			Requisite: []*csi.Topology{nodeTopology},
 		},
@@ -526,6 +553,9 @@ func TestCreateVolume_Idempotency(t *testing.T) {
 		VolumeCapabilities: []*csi.VolumeCapability{
 			accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 		},
+		Parameters: map[string]string{
+			"type": "SSD",
+		},
 		AccessibilityRequirements: &csi.TopologyRequirement{
 			Requisite: []*csi.Topology{
 				{Segments: map[string]string{driver.TopologyZoneKey: "eu-de-01"}},
@@ -558,6 +588,7 @@ func TestCreateVolume_Idempotency(t *testing.T) {
 			LimitBytes:    10 * 1024 * 1024 * 1024,
 		},
 		VolumeCapabilities:        req.VolumeCapabilities,
+		Parameters:                req.Parameters,
 		AccessibilityRequirements: req.AccessibilityRequirements,
 	}
 
@@ -717,6 +748,9 @@ func TestCreateVolume_ValidationFailures(t *testing.T) {
 		VolumeCapabilities: []*csi.VolumeCapability{
 			accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 		},
+		Parameters: map[string]string{
+			"type": "SSD",
+		},
 	}
 	_, err = svc.CreateVolume(context.Background(), reqMissingZone)
 	if status.Code(err) != codes.InvalidArgument {
@@ -731,6 +765,7 @@ func TestCreateVolume_ValidationFailures(t *testing.T) {
 			LimitBytes:    10 * 1024 * 1024 * 1024,
 		},
 		VolumeCapabilities: reqMissingZone.VolumeCapabilities,
+		Parameters:         reqMissingZone.Parameters,
 		AccessibilityRequirements: &csi.TopologyRequirement{
 			Requisite: []*csi.Topology{
 				{Segments: map[string]string{driver.TopologyZoneKey: "eu-de-01"}},
@@ -843,6 +878,445 @@ func TestValidateVolumeCapabilities(t *testing.T) {
 	}
 }
 
+// requisiteZone describes a topology requirement fixing one availability zone.
+func requisiteZone(zone string) *csi.TopologyRequirement {
+	return &csi.TopologyRequirement{
+		Requisite: []*csi.Topology{
+			{Segments: map[string]string{driver.TopologyZoneKey: zone}},
+		},
+	}
+}
+
+// TestCreateVolume_AcceptsOnlyTheDeclaredParameters fixes the accepted StorageClass parameter set.
+// The container orchestrator owns its own key namespace, so those keys are ignored rather than
+// refused, and every other key is refused before any cloud effect.
+func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		parameters map[string]string
+		topology   *csi.TopologyRequirement
+		wantCode   codes.Code
+		wantType   string
+		wantZone   string
+	}{
+		{
+			name:       "type alone with topology",
+			parameters: map[string]string{"type": "SSD"},
+			topology:   requisiteZone("eu-de-01"),
+			wantCode:   codes.OK,
+			wantType:   "SSD",
+			wantZone:   "eu-de-01",
+		},
+		{
+			name: "availability_zone supplies the zone when topology does not",
+			parameters: map[string]string{
+				"type":              "SSD",
+				"availability_zone": "eu-de-03",
+			},
+			wantCode: codes.OK,
+			wantType: "SSD",
+			wantZone: "eu-de-03",
+		},
+		{
+			name: "orchestrator-reserved keys are ignored",
+			parameters: map[string]string{
+				"type":                                       "SAS",
+				"csi.storage.k8s.io/pvc/name":                "my-claim",
+				"csi.storage.k8s.io/pvc/namespace":           "default",
+				"csi.storage.k8s.io/provisioner-secret-name": "unused",
+			},
+			topology: requisiteZone("eu-de-01"),
+			wantCode: codes.OK,
+			wantType: "SAS",
+			wantZone: "eu-de-01",
+		},
+		{
+			name:       "absent type is refused",
+			parameters: map[string]string{"availability_zone": "eu-de-01"},
+			topology:   requisiteZone("eu-de-01"),
+			wantCode:   codes.InvalidArgument,
+		},
+		{
+			name:       "nil parameters are refused",
+			parameters: nil,
+			topology:   requisiteZone("eu-de-01"),
+			wantCode:   codes.InvalidArgument,
+		},
+		{
+			name:       "blank type is refused",
+			parameters: map[string]string{"type": "   "},
+			topology:   requisiteZone("eu-de-01"),
+			wantCode:   codes.InvalidArgument,
+		},
+		{
+			name: "withdrawn volume_type alias is refused",
+			parameters: map[string]string{
+				"type":        "SSD",
+				"volume_type": "SSD",
+			},
+			topology: requisiteZone("eu-de-01"),
+			wantCode: codes.InvalidArgument,
+		},
+		{
+			name: "withdrawn zone alias is refused",
+			parameters: map[string]string{
+				"type": "SSD",
+				"zone": "eu-de-01",
+			},
+			topology: requisiteZone("eu-de-01"),
+			wantCode: codes.InvalidArgument,
+		},
+		{
+			name: "any other key is refused",
+			parameters: map[string]string{
+				"type":   "SSD",
+				"fsType": "ext4",
+			},
+			topology: requisiteZone("eu-de-01"),
+			wantCode: codes.InvalidArgument,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newMockEVSClient()
+			svc, err := driver.NewControllerService(client, validTestConfig())
+			if err != nil {
+				t.Fatalf("NewControllerService failed: %v", err)
+			}
+
+			_, err = svc.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+				Name:                      "parameter-vol",
+				VolumeCapabilities:        []*csi.VolumeCapability{mountCapability("")},
+				Parameters:                tt.parameters,
+				AccessibilityRequirements: tt.topology,
+			})
+			if status.Code(err) != tt.wantCode {
+				t.Fatalf(
+					"CreateVolume status = %v (%v), want %v",
+					status.Code(err),
+					err,
+					tt.wantCode,
+				)
+			}
+			if tt.wantCode != codes.OK {
+				if len(client.volumes) != 0 {
+					t.Errorf("a refused request created %d volumes, want 0", len(client.volumes))
+				}
+				return
+			}
+
+			if client.lastCreate.VolumeType != tt.wantType {
+				t.Errorf(
+					"EVS create volume type = %q, want %q",
+					client.lastCreate.VolumeType,
+					tt.wantType,
+				)
+			}
+			if client.lastCreate.AvailabilityZone != tt.wantZone {
+				t.Errorf(
+					"EVS create zone = %q, want %q",
+					client.lastCreate.AvailabilityZone,
+					tt.wantZone,
+				)
+			}
+		})
+	}
+}
+
+// TestCreateVolume_RejectsAVolumeContentSource proves provisioning from a snapshot or an existing
+// volume is refused, because neither capability is advertised.
+func TestCreateVolume_RejectsAVolumeContentSource(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		source *csi.VolumeContentSource
+	}{
+		{
+			name: "snapshot source",
+			source: &csi.VolumeContentSource{
+				Type: &csi.VolumeContentSource_Snapshot{
+					Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "snap-1"},
+				},
+			},
+		},
+		{
+			name: "volume source",
+			source: &csi.VolumeContentSource{
+				Type: &csi.VolumeContentSource_Volume{
+					Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: "vol-1"},
+				},
+			},
+		},
+		{
+			name:   "source without a type",
+			source: &csi.VolumeContentSource{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newMockEVSClient()
+			svc, err := driver.NewControllerService(client, validTestConfig())
+			if err != nil {
+				t.Fatalf("NewControllerService failed: %v", err)
+			}
+
+			_, err = svc.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+				Name:                      "cloned-vol",
+				VolumeCapabilities:        []*csi.VolumeCapability{mountCapability("")},
+				Parameters:                map[string]string{"type": "SSD"},
+				AccessibilityRequirements: requisiteZone("eu-de-01"),
+				VolumeContentSource:       tt.source,
+			})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf(
+					"CreateVolume status = %v (%v), want InvalidArgument",
+					status.Code(err),
+					err,
+				)
+			}
+			if len(client.volumes) != 0 {
+				t.Errorf("a refused request created %d volumes, want 0", len(client.volumes))
+			}
+		})
+	}
+}
+
+// TestCreateVolume_ResolvesRequestedCapacity fixes the resolved EVS size. An omitted or smaller
+// requested capacity resolves to the declared minimum data-volume size, a partial GiB rounds up, and
+// no requested size is capped.
+func TestCreateVolume_ResolvesRequestedCapacity(t *testing.T) {
+	t.Parallel()
+
+	const gib = int64(1024 * 1024 * 1024)
+
+	tests := []struct {
+		name        string
+		capacity    *csi.CapacityRange
+		wantSizeGiB int
+	}{
+		{
+			name:        "omitted range resolves to the declared minimum",
+			wantSizeGiB: 10,
+		},
+		{
+			name:        "empty range resolves to the declared minimum",
+			capacity:    &csi.CapacityRange{},
+			wantSizeGiB: 10,
+		},
+		{
+			name:        "below-minimum request resolves to the declared minimum",
+			capacity:    &csi.CapacityRange{RequiredBytes: gib},
+			wantSizeGiB: 10,
+		},
+		{
+			name:        "one byte resolves to the declared minimum",
+			capacity:    &csi.CapacityRange{RequiredBytes: 1},
+			wantSizeGiB: 10,
+		},
+		{
+			name:        "limit alone resolves to the declared minimum",
+			capacity:    &csi.CapacityRange{LimitBytes: 40 * gib},
+			wantSizeGiB: 10,
+		},
+		{
+			name:        "whole GiB request passes through",
+			capacity:    &csi.CapacityRange{RequiredBytes: 20 * gib},
+			wantSizeGiB: 20,
+		},
+		{
+			name:        "partial GiB request rounds up",
+			capacity:    &csi.CapacityRange{RequiredBytes: 20*gib + 1},
+			wantSizeGiB: 21,
+		},
+		{
+			name:        "half GiB above the minimum rounds up",
+			capacity:    &csi.CapacityRange{RequiredBytes: 10*gib + gib/2},
+			wantSizeGiB: 11,
+		},
+		{
+			name: "large request is not capped",
+			capacity: &csi.CapacityRange{
+				RequiredBytes: 32768 * gib,
+			},
+			wantSizeGiB: 32768,
+		},
+		{
+			name: "satisfiable limit is honoured",
+			capacity: &csi.CapacityRange{
+				RequiredBytes: 15 * gib,
+				LimitBytes:    20 * gib,
+			},
+			wantSizeGiB: 15,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newMockEVSClient()
+			svc, err := driver.NewControllerService(client, validTestConfig())
+			if err != nil {
+				t.Fatalf("NewControllerService failed: %v", err)
+			}
+
+			resp, err := svc.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+				Name:                      "capacity-vol",
+				CapacityRange:             tt.capacity,
+				VolumeCapabilities:        []*csi.VolumeCapability{mountCapability("")},
+				Parameters:                map[string]string{"type": "SSD"},
+				AccessibilityRequirements: requisiteZone("eu-de-01"),
+			})
+			if err != nil {
+				t.Fatalf("CreateVolume failed: %v", err)
+			}
+
+			if client.lastCreate.Size != tt.wantSizeGiB {
+				t.Errorf(
+					"EVS create size = %d GiB, want %d GiB",
+					client.lastCreate.Size,
+					tt.wantSizeGiB,
+				)
+			}
+			if want := int64(tt.wantSizeGiB) * gib; resp.GetVolume().GetCapacityBytes() != want {
+				t.Errorf(
+					"reported capacity = %d bytes, want %d bytes",
+					resp.GetVolume().GetCapacityBytes(),
+					want,
+				)
+			}
+		})
+	}
+}
+
+// TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity proves a malformed capacity range
+// is refused as caller input while a well-formed range no supported size can satisfy receives the
+// CSI-prescribed out-of-range status, so a caller can tell the two apart.
+func TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity(t *testing.T) {
+	t.Parallel()
+
+	const gib = int64(1024 * 1024 * 1024)
+
+	tests := []struct {
+		name     string
+		capacity *csi.CapacityRange
+		wantCode codes.Code
+	}{
+		{
+			name: "required above limit is malformed",
+			capacity: &csi.CapacityRange{
+				RequiredBytes: 20 * gib,
+				LimitBytes:    10 * gib,
+			},
+			wantCode: codes.InvalidArgument,
+		},
+		{
+			name:     "negative required bytes are malformed",
+			capacity: &csi.CapacityRange{RequiredBytes: -1},
+			wantCode: codes.InvalidArgument,
+		},
+		{
+			name:     "negative limit bytes are malformed",
+			capacity: &csi.CapacityRange{LimitBytes: -1},
+			wantCode: codes.InvalidArgument,
+		},
+		{
+			name:     "limit below the declared minimum is unsatisfiable",
+			capacity: &csi.CapacityRange{LimitBytes: 5 * gib},
+			wantCode: codes.OutOfRange,
+		},
+		{
+			name: "resolved minimum above the limit is unsatisfiable",
+			capacity: &csi.CapacityRange{
+				RequiredBytes: gib,
+				LimitBytes:    5 * gib,
+			},
+			wantCode: codes.OutOfRange,
+		},
+		{
+			name: "limit between whole GiB sizes is unsatisfiable",
+			capacity: &csi.CapacityRange{
+				RequiredBytes: 20*gib + 1,
+				LimitBytes:    20*gib + 2,
+			},
+			wantCode: codes.OutOfRange,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newMockEVSClient()
+			svc, err := driver.NewControllerService(client, validTestConfig())
+			if err != nil {
+				t.Fatalf("NewControllerService failed: %v", err)
+			}
+
+			_, err = svc.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+				Name:                      "range-vol",
+				CapacityRange:             tt.capacity,
+				VolumeCapabilities:        []*csi.VolumeCapability{mountCapability("")},
+				Parameters:                map[string]string{"type": "SSD"},
+				AccessibilityRequirements: requisiteZone("eu-de-01"),
+			})
+			if status.Code(err) != tt.wantCode {
+				t.Fatalf(
+					"CreateVolume status = %v (%v), want %v",
+					status.Code(err),
+					err,
+					tt.wantCode,
+				)
+			}
+			if len(client.volumes) != 0 {
+				t.Errorf("a refused request created %d volumes, want 0", len(client.volumes))
+			}
+		})
+	}
+}
+
+// TestCreateVolume_ReflectsNoParameterIntoTheResponse proves the volume context stays empty and no
+// operator-supplied parameter is echoed to the caller, so no consumer can begin depending on
+// parameter reflection.
+func TestCreateVolume_ReflectsNoParameterIntoTheResponse(t *testing.T) {
+	t.Parallel()
+
+	client := newMockEVSClient()
+	svc, err := driver.NewControllerService(client, validTestConfig())
+	if err != nil {
+		t.Fatalf("NewControllerService failed: %v", err)
+	}
+
+	resp, err := svc.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "context-vol",
+		VolumeCapabilities: []*csi.VolumeCapability{mountCapability("")},
+		Parameters: map[string]string{
+			"type":                        "SSD",
+			"availability_zone":           "eu-de-03",
+			"csi.storage.k8s.io/pvc/name": "my-claim",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume failed: %v", err)
+	}
+
+	if volumeContext := resp.GetVolume().GetVolumeContext(); len(volumeContext) != 0 {
+		t.Errorf("volume context = %v, want empty", volumeContext)
+	}
+	if resp.GetVolume().GetContentSource() != nil {
+		t.Errorf("content source = %v, want nil", resp.GetVolume().GetContentSource())
+	}
+}
+
 func TestControllerService_GRPC_WireTransport(t *testing.T) {
 	t.Parallel()
 
@@ -874,6 +1348,9 @@ func TestControllerService_GRPC_WireTransport(t *testing.T) {
 		},
 		VolumeCapabilities: []*csi.VolumeCapability{
 			mountCapability(""),
+		},
+		Parameters: map[string]string{
+			"type": "SSD",
 		},
 		AccessibilityRequirements: &csi.TopologyRequirement{
 			Requisite: []*csi.Topology{
@@ -1011,6 +1488,9 @@ func TestControllerService_UnixDomainSocket_WireTransport(t *testing.T) {
 		Name: "uds-volume",
 		VolumeCapabilities: []*csi.VolumeCapability{
 			accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+		},
+		Parameters: map[string]string{
+			"type": "SSD",
 		},
 		AccessibilityRequirements: &csi.TopologyRequirement{
 			Requisite: []*csi.Topology{

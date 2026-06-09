@@ -33,6 +33,8 @@ var (
 	ErrConflict = errors.New("cloud operation conflict")
 	// ErrInvalidArgument indicates invalid or rejected operation inputs.
 	ErrInvalidArgument = errors.New("cloud rejected input")
+	// ErrNotOwned indicates the target volume does not carry this driver's ownership marker.
+	ErrNotOwned = errors.New("volume is not owned by this driver")
 	// ErrUnauthenticated indicates authentication failure with the cloud service.
 	ErrUnauthenticated = errors.New("cloud authentication failed")
 	// ErrPermissionDenied indicates authorization failure for the requested operation.
@@ -216,6 +218,7 @@ func classifyErrorKind(err error) error {
 	case errors.Is(err, ErrNotFound),
 		errors.Is(err, ErrConflict),
 		errors.Is(err, ErrInvalidArgument),
+		errors.Is(err, ErrNotOwned),
 		errors.Is(err, ErrUnauthenticated),
 		errors.Is(err, ErrPermissionDenied),
 		errors.Is(err, ErrUnavailable),

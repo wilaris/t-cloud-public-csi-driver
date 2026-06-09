@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -18,10 +20,17 @@ import (
 const (
 	// TopologyZoneKey is the standard CSI topology key for availability zones.
 	TopologyZoneKey = "topology.kubernetes.io/zone"
-	// DefaultVolumeType is the default EVS volume type used when none is specified.
-	DefaultVolumeType = "SSD"
-	// DefaultVolumeSizeGiB is the default volume size in GiB when capacity is not specified.
-	DefaultVolumeSizeGiB = 1
+	// paramVolumeType is the accepted StorageClass parameter naming the EVS volume type.
+	paramVolumeType = "type"
+	// paramAvailabilityZone is the accepted StorageClass parameter naming the availability zone.
+	paramAvailabilityZone = "availability_zone"
+	// coReservedParameterPrefix is the StorageClass parameter namespace owned by the container
+	// orchestrator.
+	coReservedParameterPrefix = "csi.storage.k8s.io/"
+	// minVolumeSizeGiB is the declared EVS minimum data-volume size. It resolves an omitted or
+	// smaller requested capacity; it is never a lower-bound check, so a request is refused only
+	// when the resolved size exceeds limit_bytes.
+	minVolumeSizeGiB = 10
 	// bytesInGiB is the number of bytes in one GiB.
 	bytesInGiB = 1024 * 1024 * 1024
 )
@@ -30,7 +39,7 @@ const (
 type EVSClient interface {
 	CreateVolume(ctx context.Context, opts evs.CreateVolumeOpts) (*evs.Volume, error)
 	GetVolume(ctx context.Context, id string) (*evs.Volume, error)
-	ListVolumes(ctx context.Context, opts evs.ListVolumeOpts) ([]evs.Volume, error)
+	DiscoverVolume(ctx context.Context, opts evs.DiscoverVolumeOpts) (*evs.Volume, error)
 	DeleteVolume(ctx context.Context, id string) error
 	AttachVolume(ctx context.Context, volumeID, serverID string) error
 	DetachVolume(ctx context.Context, volumeID, serverID string) error
@@ -165,12 +174,27 @@ func (s *ControllerService) CreateVolume(
 		}
 	}
 
-	sizeGiB, err := calculateSizeGiB(req.GetCapacityRange())
-	if err != nil {
+	if req.GetVolumeContentSource() != nil {
+		return nil, status.Error(
+			codes.InvalidArgument,
+			"provisioning from a volume content source is not supported",
+		)
+	}
+
+	params := req.GetParameters()
+	if err := validateParameters(params); err != nil {
 		return nil, err
 	}
 
-	zone := pickAvailabilityZone(req.GetAccessibilityRequirements(), req.GetParameters())
+	volType := strings.TrimSpace(params[paramVolumeType])
+	if volType == "" {
+		return nil, status.Error(
+			codes.InvalidArgument,
+			fmt.Sprintf("StorageClass parameter %q is required", paramVolumeType),
+		)
+	}
+
+	zone := pickAvailabilityZone(req.GetAccessibilityRequirements(), params)
 	if zone == "" {
 		return nil, status.Error(
 			codes.InvalidArgument,
@@ -178,82 +202,36 @@ func (s *ControllerService) CreateVolume(
 		)
 	}
 
-	volType := strings.TrimSpace(req.GetParameters()["type"])
-	if volType == "" {
-		volType = strings.TrimSpace(req.GetParameters()["volume_type"])
-	}
-	if volType == "" {
-		volType = DefaultVolumeType
-	}
-
-	existing, err := s.evsClient.ListVolumes(ctx, evs.ListVolumeOpts{
-		Name: req.GetName(),
-	})
+	sizeGiB, err := resolveSizeGiB(req.GetCapacityRange())
 	if err != nil {
-		return nil, toGRPCError("list volumes for idempotency check", err)
+		return nil, err
 	}
 
-	for _, vol := range existing {
-		if vol.Name == req.GetName() {
-			if vol.Size < sizeGiB {
-				return nil, status.Error(
-					codes.AlreadyExists,
-					fmt.Sprintf(
-						"volume %q already exists with size %d GiB, smaller than requested %d GiB",
-						req.GetName(),
-						vol.Size,
-						sizeGiB,
-					),
-				)
-			}
-			limitBytes := req.GetCapacityRange().GetLimitBytes()
-			if limitBytes > 0 && int64(vol.Size)*bytesInGiB > limitBytes {
-				return nil, status.Error(
-					codes.AlreadyExists,
-					fmt.Sprintf(
-						"volume %q already exists with size %d GiB, exceeding limit_bytes %d",
-						req.GetName(),
-						vol.Size,
-						limitBytes,
-					),
-				)
-			}
-			if vol.VolumeType != volType {
-				return nil, status.Error(
-					codes.AlreadyExists,
-					fmt.Sprintf(
-						"volume %q already exists with an incompatible volume type",
-						req.GetName(),
-					),
-				)
-			}
-			if vol.AvailabilityZone != zone {
-				return nil, status.Error(
-					codes.AlreadyExists,
-					fmt.Sprintf(
-						"volume %q already exists in an incompatible availability zone",
-						req.GetName(),
-					),
-				)
-			}
-			return formatCreateVolumeResponse(&vol, req.GetParameters()), nil
-		}
+	existing, err := s.evsClient.DiscoverVolume(ctx, evs.DiscoverVolumeOpts{
+		Name:             req.GetName(),
+		AvailabilityZone: zone,
+		VolumeType:       volType,
+		MinSizeGiB:       sizeGiB,
+		MaxSizeGiB:       limitSizeGiB(req.GetCapacityRange()),
+	})
+	if err == nil {
+		return formatCreateVolumeResponse(existing), nil
+	}
+	if !errors.Is(err, evs.ErrNotFound) {
+		return nil, toGRPCError("discover existing volume", err)
 	}
 
-	opts := evs.CreateVolumeOpts{
+	created, err := s.evsClient.CreateVolume(ctx, evs.CreateVolumeOpts{
 		Name:             req.GetName(),
 		Size:             sizeGiB,
 		AvailabilityZone: zone,
 		VolumeType:       volType,
-		Metadata:         req.GetParameters(),
-	}
-
-	created, err := s.evsClient.CreateVolume(ctx, opts)
+	})
 	if err != nil {
-		return nil, toGRPCError(fmt.Sprintf("create volume %q", req.GetName()), err)
+		return nil, toGRPCError("create volume", err)
 	}
 
-	return formatCreateVolumeResponse(created, req.GetParameters()), nil
+	return formatCreateVolumeResponse(created), nil
 }
 
 // DeleteVolume idempotently deletes an EVS volume.
@@ -348,12 +326,30 @@ func validateVolumeCapability(cap *csi.VolumeCapability) error {
 	}
 }
 
-// calculateSizeGiB converts a CSI CapacityRange to size in GiB, enforcing minimums and limits.
-func calculateSizeGiB(capRange *csi.CapacityRange) (int, error) {
-	if capRange == nil {
-		return DefaultVolumeSizeGiB, nil
+// validateParameters rejects StorageClass parameter keys the driver does not accept. Keys reserved
+// for the container orchestrator are ignored, because the CO owns that namespace.
+func validateParameters(params map[string]string) error {
+	for _, key := range slices.Sorted(maps.Keys(params)) {
+		switch {
+		case strings.HasPrefix(key, coReservedParameterPrefix):
+			continue
+		case key == paramVolumeType, key == paramAvailabilityZone:
+			continue
+		default:
+			return status.Error(
+				codes.InvalidArgument,
+				fmt.Sprintf("unsupported StorageClass parameter %q", key),
+			)
+		}
 	}
 
+	return nil
+}
+
+// resolveSizeGiB resolves a CSI capacity range to a whole-GiB EVS volume size. An omitted range or a
+// required size below the declared EVS minimum resolves to that minimum. A present required size is
+// rounded up to whole GiB and never capped, leaving every upper bound to EVS.
+func resolveSizeGiB(capRange *csi.CapacityRange) (int, error) {
 	reqBytes := capRange.GetRequiredBytes()
 	limitBytes := capRange.GetLimitBytes()
 
@@ -367,23 +363,35 @@ func calculateSizeGiB(capRange *csi.CapacityRange) (int, error) {
 		)
 	}
 
-	if reqBytes == 0 {
-		reqBytes = int64(DefaultVolumeSizeGiB) * bytesInGiB
+	roundedBytes := reqBytes + bytesInGiB - 1
+	if roundedBytes < reqBytes {
+		return 0, status.Error(
+			codes.OutOfRange,
+			"required_bytes exceeds the largest expressible volume size",
+		)
 	}
 
-	sizeGiB := int((reqBytes + bytesInGiB - 1) / bytesInGiB)
-	if sizeGiB < 1 {
-		sizeGiB = 1
-	}
+	sizeGiB := max(int(roundedBytes/bytesInGiB), minVolumeSizeGiB)
 
 	if limitBytes > 0 && int64(sizeGiB)*bytesInGiB > limitBytes {
 		return 0, status.Error(
-			codes.InvalidArgument,
-			fmt.Sprintf("calculated size (%d GiB) exceeds limit_bytes (%d)", sizeGiB, limitBytes),
+			codes.OutOfRange,
+			fmt.Sprintf("no supported volume size satisfies limit_bytes (%d)", limitBytes),
 		)
 	}
 
 	return sizeGiB, nil
+}
+
+// limitSizeGiB converts a capacity range upper bound to whole GiB, returning zero when the request
+// declares no upper bound.
+func limitSizeGiB(capRange *csi.CapacityRange) int {
+	limitBytes := capRange.GetLimitBytes()
+	if limitBytes <= 0 {
+		return 0
+	}
+
+	return int(limitBytes / bytesInGiB)
 }
 
 // pickAvailabilityZone selects an availability zone from topology requirements or parameters.
@@ -401,31 +409,21 @@ func pickAvailabilityZone(topReq *csi.TopologyRequirement, params map[string]str
 		}
 	}
 
-	if zone, ok := params["availability_zone"]; ok && strings.TrimSpace(zone) != "" {
-		return strings.TrimSpace(zone)
-	}
-	if zone, ok := params["zone"]; ok && strings.TrimSpace(zone) != "" {
+	if zone, ok := params[paramAvailabilityZone]; ok && strings.TrimSpace(zone) != "" {
 		return strings.TrimSpace(zone)
 	}
 
 	return ""
 }
 
-// formatCreateVolumeResponse converts an evs.Volume struct into a csi.CreateVolumeResponse.
-func formatCreateVolumeResponse(
-	vol *evs.Volume,
-	params map[string]string,
-) *csi.CreateVolumeResponse {
-	volumeContext := make(map[string]string)
-	for k, v := range params {
-		volumeContext[k] = v
-	}
-
+// formatCreateVolumeResponse converts an evs.Volume struct into a csi.CreateVolumeResponse. The
+// volume context stays empty: the attachment handoff uses the publish context, and no accepted
+// consumer requires a provisioning value on this surface.
+func formatCreateVolumeResponse(vol *evs.Volume) *csi.CreateVolumeResponse {
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:      vol.ID,
 			CapacityBytes: int64(vol.Size) * bytesInGiB,
-			VolumeContext: volumeContext,
 			AccessibleTopology: []*csi.Topology{
 				{
 					Segments: map[string]string{
