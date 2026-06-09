@@ -202,8 +202,7 @@ func TestGetFilesystemType(t *testing.T) {
 		t.Errorf("expected xfs from lsblk fallback, got: %s, err: %v", fsType, err)
 	}
 
-	// A device whose filesystem cannot be determined is an error, not an empty string,
-	// so that callers never mistake it for an unformatted device and overwrite it.
+	// Both probes failing must surface as an error.
 	fe.handlers["lsblk"] = func(args ...string) ([]byte, error) {
 		return nil, errors.New("lsblk unavailable")
 	}
@@ -264,7 +263,7 @@ func TestMount(t *testing.T) {
 		t.Errorf("expected no filesystem type for a bind mount, got: %q", mp.Type)
 	}
 
-	// Mounting an already mounted target is a no-op rather than a stacked mount.
+	// Remounting an already-mounted target is a no-op.
 	if err := mounter.Mount(ctx, "/dev/sdb", targetPath, "", []string{"bind"}); err != nil {
 		t.Fatalf("expected idempotent Mount success, got: %v", err)
 	}
@@ -275,7 +274,7 @@ func TestMount(t *testing.T) {
 		)
 	}
 
-	// A cancelled context is refused before touching the host.
+	// A canceled context is rejected before any host call.
 	cancelledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	err := mounter.Mount(cancelledCtx, "/dev/sdb", filepath.Join(tmpDir, "other"), "", nil)
@@ -408,6 +407,50 @@ func TestFormatAndMount(t *testing.T) {
 	for _, call := range undetectableExec.calls {
 		if strings.HasPrefix(call, "mkfs") {
 			t.Errorf("expected no format attempt when detection fails, got call %q", call)
+		}
+	}
+}
+
+// IsSupportedFilesystemType and FormatAndMount must agree on every name.
+func TestSupportedFilesystemAgreement(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	names := []string{"ext4", "xfs", "EXT4", "btrfs", "zfs", "ntfs"}
+	for i, name := range names {
+		fe := newFakeExec()
+		fe.handlers["blkid"] = func(args ...string) ([]byte, error) {
+			return []byte(""), nil
+		}
+		fe.handlers["lsblk"] = func(args ...string) ([]byte, error) {
+			return []byte(""), nil
+		}
+		fe.handlers["mkfs.ext4"] = func(args ...string) ([]byte, error) {
+			return []byte("done"), nil
+		}
+		fe.handlers["mkfs.xfs"] = func(args ...string) ([]byte, error) {
+			return []byte("done"), nil
+		}
+
+		mounter := NewLinuxMounter(
+			WithMountUtilsInterface(mountutils.NewFakeMounter(nil)),
+			WithExecInterface(fe),
+		)
+
+		err := mounter.FormatAndMount(
+			context.Background(),
+			"/dev/sdb",
+			filepath.Join(tmpDir, fmt.Sprintf("agree-target-%d", i)),
+			name,
+			nil,
+		)
+		refusedByMounter := errors.Is(err, ErrUnsupportedFilesystem)
+		if IsSupportedFilesystemType(name) == refusedByMounter {
+			t.Errorf(
+				"predicate and mounter disagree about %q: supported=%v, mounter error=%v",
+				name,
+				IsSupportedFilesystemType(name),
+				err,
+			)
 		}
 	}
 }

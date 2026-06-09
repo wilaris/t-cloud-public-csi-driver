@@ -64,7 +64,7 @@ func (s *NodeService) NodeGetInfo(
 	ctx context.Context,
 	req *csi.NodeGetInfoRequest,
 ) (*csi.NodeGetInfoResponse, error) {
-	if s.cfg == nil || s.cfg.NodeID == "" {
+	if s.cfg.NodeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "node ID is not configured")
 	}
 	if s.cfg.AvailabilityZone == "" {
@@ -232,12 +232,20 @@ func (s *NodeService) NodePublishVolume(
 		return nil, err
 	}
 
+	// Reject a writable publish for a read-only mode before touching the host.
+	readOnlyMode := req.GetVolumeCapability().GetAccessMode().GetMode() ==
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
+	if readOnlyMode && !req.GetReadonly() {
+		return nil, status.Error(
+			codes.InvalidArgument,
+			"writable publication requested for a read-only access mode",
+		)
+	}
+
 	stagingPath := req.GetStagingTargetPath()
 	targetPath := req.GetTargetPath()
 
-	// Publishing is always a bind mount, so the filesystem type of the source is not
-	// consulted and the source is never formatted. NodeStageVolume already created the
-	// filesystem for a mounted volume, and a raw block volume must be published untouched.
+	// Publishing is always a bind mount; the source is never probed or formatted here.
 	mountOptions := []string{"bind"}
 	if req.GetReadonly() {
 		mountOptions = append(mountOptions, "ro")
@@ -393,8 +401,6 @@ func createBlockTargetFile(targetPath string) error {
 		)
 	}
 
-	// The target path is chosen by the container orchestrator, which owns the directory
-	// tree this placeholder is created in.
 	f, err := os.OpenFile( //nolint:gosec // target path is supplied by the orchestrator
 		targetPath,
 		os.O_CREATE|os.O_RDWR,
@@ -416,9 +422,8 @@ func createBlockTargetFile(targetPath string) error {
 	return nil
 }
 
-// removeMountPath deletes an unmounted staging or target path. Removal is not recursive:
-// a path that still holds content indicates that the unmount did not take effect, which is
-// reported rather than resolved by deleting volume data.
+// removeMountPath removes an empty staging or target path. Non-recursive on purpose: leftover
+// content means the unmount didn't take effect, and deleting it would destroy volume data.
 func removeMountPath(path string) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return status.Error(

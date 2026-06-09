@@ -15,6 +15,7 @@ import (
 
 	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
 	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
+	"wilaris.dev/t-cloud-public-csi-driver/internal/mount"
 )
 
 const (
@@ -114,10 +115,20 @@ func (s *ControllerService) ControllerPublishVolume(
 		return nil, err
 	}
 
+	// EVS attachments have no read-only form and we don't advertise PUBLISH_READONLY,
+	// so reject instead of silently attaching read-write.
+	if req.GetReadonly() {
+		return nil, status.Error(
+			codes.InvalidArgument,
+			"read-only publication is not supported by this driver",
+		)
+	}
+
 	err := s.evsClient.AttachVolume(ctx, req.GetVolumeId(), req.GetNodeId())
 	if err != nil {
 		return nil, toGRPCError(
 			fmt.Sprintf("publish volume %q to node %q", req.GetVolumeId(), req.GetNodeId()),
+			codes.FailedPrecondition,
 			err,
 		)
 	}
@@ -146,6 +157,7 @@ func (s *ControllerService) ControllerUnpublishVolume(
 	if err != nil {
 		return nil, toGRPCError(
 			fmt.Sprintf("unpublish volume %q from node %q", req.GetVolumeId(), req.GetNodeId()),
+			codes.Aborted,
 			err,
 		)
 	}
@@ -168,8 +180,8 @@ func (s *ControllerService) CreateVolume(
 		return nil, status.Error(codes.InvalidArgument, "volume capabilities cannot be empty")
 	}
 
-	for _, cap := range req.GetVolumeCapabilities() {
-		if err := validateVolumeCapability(cap); err != nil {
+	for _, vc := range req.GetVolumeCapabilities() {
+		if err := validateVolumeCapability(vc); err != nil {
 			return nil, err
 		}
 	}
@@ -218,7 +230,7 @@ func (s *ControllerService) CreateVolume(
 		return formatCreateVolumeResponse(existing), nil
 	}
 	if !errors.Is(err, evs.ErrNotFound) {
-		return nil, toGRPCError("discover existing volume", err)
+		return nil, toGRPCError("discover existing volume", codes.AlreadyExists, err)
 	}
 
 	created, err := s.evsClient.CreateVolume(ctx, evs.CreateVolumeOpts{
@@ -228,7 +240,7 @@ func (s *ControllerService) CreateVolume(
 		VolumeType:       volType,
 	})
 	if err != nil {
-		return nil, toGRPCError("create volume", err)
+		return nil, toGRPCError("create volume", codes.AlreadyExists, err)
 	}
 
 	return formatCreateVolumeResponse(created), nil
@@ -251,7 +263,21 @@ func (s *ControllerService) DeleteVolume(
 		if errors.Is(err, evs.ErrNotFound) {
 			return &csi.DeleteVolumeResponse{}, nil
 		}
-		return nil, toGRPCError(fmt.Sprintf("delete volume %q", req.GetVolumeId()), err)
+		// Refusing to delete a volume we don't own is expected, not an internal error — map it explicitly.
+		if errors.Is(err, evs.ErrNotOwned) {
+			return nil, status.Error(
+				codes.FailedPrecondition,
+				fmt.Sprintf(
+					"delete volume %q: volume carries no ownership marker for this driver",
+					req.GetVolumeId(),
+				),
+			)
+		}
+		return nil, toGRPCError(
+			fmt.Sprintf("delete volume %q", req.GetVolumeId()),
+			codes.FailedPrecondition,
+			err,
+		)
 	}
 
 	return &csi.DeleteVolumeResponse{}, nil
@@ -280,11 +306,15 @@ func (s *ControllerService) ValidateVolumeCapabilities(
 				fmt.Sprintf("volume %q not found", req.GetVolumeId()),
 			)
 		}
-		return nil, toGRPCError(fmt.Sprintf("get volume %q", req.GetVolumeId()), err)
+		return nil, toGRPCError(
+			fmt.Sprintf("get volume %q", req.GetVolumeId()),
+			codes.Aborted,
+			err,
+		)
 	}
 
-	for _, cap := range req.GetVolumeCapabilities() {
-		if err := validateVolumeCapability(cap); err != nil {
+	for _, vc := range req.GetVolumeCapabilities() {
+		if err := validateVolumeCapability(vc); err != nil {
 			return &csi.ValidateVolumeCapabilitiesResponse{
 				Confirmed: nil,
 				Message:   "unsupported volume capability or access mode",
@@ -292,14 +322,34 @@ func (s *ControllerService) ValidateVolumeCapabilities(
 		}
 	}
 
+	// We provision with an empty volume context, so a non-empty one means the volume isn't ours.
+	if len(req.GetVolumeContext()) > 0 {
+		return &csi.ValidateVolumeCapabilitiesResponse{
+			Confirmed: nil,
+			Message:   "unsupported volume context",
+		}, nil
+	}
+
+	if err := validateParameters(req.GetParameters()); err != nil {
+		return &csi.ValidateVolumeCapabilitiesResponse{
+			Confirmed: nil,
+			Message:   "unsupported volume parameter",
+		}, nil
+	}
+
+	// Echo the validated fields so the CO can detect fields the plugin ignored.
 	return &csi.ValidateVolumeCapabilitiesResponse{
 		Confirmed: &csi.ValidateVolumeCapabilitiesResponse_Confirmed{
+			VolumeContext:      req.GetVolumeContext(),
 			VolumeCapabilities: req.GetVolumeCapabilities(),
+			Parameters:         req.GetParameters(),
 		},
 	}, nil
 }
 
-// validateVolumeCapability validates that a volume uses a supported single-node access mode.
+// validateVolumeCapability rejects unsupported access modes and filesystems before any cloud
+// or host side effects. SINGLE_NODE_SINGLE_WRITER and SINGLE_NODE_MULTI_WRITER are rejected
+// because the CSI spec gates them behind a Node capability we don't advertise.
 func validateVolumeCapability(cap *csi.VolumeCapability) error {
 	if cap == nil {
 		return status.Error(codes.InvalidArgument, "volume capability cannot be nil")
@@ -311,19 +361,28 @@ func validateVolumeCapability(cap *csi.VolumeCapability) error {
 
 	switch accessMode.GetMode() {
 	case csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
-		csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER:
-		return nil
+		csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY:
 	default:
 		return status.Error(
 			codes.InvalidArgument,
 			fmt.Sprintf(
-				"unsupported access mode %s: only single-node modes supported",
+				"unsupported access mode %s: only SINGLE_NODE_WRITER and SINGLE_NODE_READER_ONLY are supported",
 				accessMode.GetMode(),
 			),
 		)
 	}
+
+	// Raw block access carries no filesystem and is never formatted, so only a mounted capability has
+	// a filesystem to check. An omitted name resolves to the default at staging time.
+	fsType := strings.TrimSpace(cap.GetMount().GetFsType())
+	if fsType != "" && !mount.IsSupportedFilesystemType(fsType) {
+		return status.Error(
+			codes.InvalidArgument,
+			"unsupported filesystem: only ext4 and xfs are supported",
+		)
+	}
+
+	return nil
 }
 
 // validateParameters rejects StorageClass parameter keys the driver does not accept. Keys reserved
@@ -416,9 +475,8 @@ func pickAvailabilityZone(topReq *csi.TopologyRequirement, params map[string]str
 	return ""
 }
 
-// formatCreateVolumeResponse converts an evs.Volume struct into a csi.CreateVolumeResponse. The
-// volume context stays empty: the attachment handoff uses the publish context, and no accepted
-// consumer requires a provisioning value on this surface.
+// formatCreateVolumeResponse converts an evs.Volume into a csi.CreateVolumeResponse.
+// Volume context stays empty; the attach handoff uses the publish context.
 func formatCreateVolumeResponse(vol *evs.Volume) *csi.CreateVolumeResponse {
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
@@ -436,7 +494,10 @@ func formatCreateVolumeResponse(vol *evs.Volume) *csi.CreateVolumeResponse {
 }
 
 // toGRPCError converts package domain errors into canonical gRPC status errors.
-func toGRPCError(op string, err error) error {
+//
+// conflictCode is the code CSI assigns to a conflict for this operation; it differs per
+// operation and sidecars branch on it, so the caller passes it in.
+func toGRPCError(op string, conflictCode codes.Code, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -447,7 +508,7 @@ func toGRPCError(op string, err error) error {
 	case errors.Is(err, evs.ErrInvalidArgument):
 		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: %v", op, err))
 	case errors.Is(err, evs.ErrConflict):
-		return status.Error(codes.AlreadyExists, fmt.Sprintf("%s: %v", op, err))
+		return status.Error(conflictCode, fmt.Sprintf("%s: %v", op, err))
 	case errors.Is(err, evs.ErrUnauthenticated):
 		return status.Error(codes.Unauthenticated, fmt.Sprintf("%s: %v", op, err))
 	case errors.Is(err, evs.ErrPermissionDenied):

@@ -45,6 +45,17 @@ const (
 	mountPathPerm = 0o750
 )
 
+// IsSupportedFilesystemType reports whether fsType is a filesystem we format and mount
+// (case-insensitive). Empty is unsupported; callers substitute DefaultFilesystemType first.
+func IsSupportedFilesystemType(fsType string) bool {
+	switch strings.ToLower(fsType) {
+	case "ext4", "xfs":
+		return true
+	default:
+		return false
+	}
+}
+
 // Mounter defines host block device discovery, formatting, mounting, and unmounting operations.
 type Mounter interface {
 	DiscoverDevice(ctx context.Context, deviceIdentifier string) (string, error)
@@ -186,9 +197,8 @@ func (m *LinuxMounter) deviceCandidates(deviceIdentifier string) []string {
 
 // GetFilesystemType inspects existing filesystem on source block device using blkid or lsblk.
 //
-// An empty string with a nil error means the device carries no filesystem. A device whose
-// filesystem cannot be determined is reported as an error rather than as an empty string,
-// so that callers never mistake an unreadable device for an unformatted one and overwrite it.
+// "" with a nil error means no filesystem. An undetectable filesystem is an error, never "",
+// so an unreadable device can't be mistaken for an unformatted one and overwritten.
 func (m *LinuxMounter) GetFilesystemType(ctx context.Context, source string) (string, error) {
 	if source == "" {
 		return "", fmt.Errorf("%w: source path is empty", ErrInvalidInput)
@@ -246,7 +256,7 @@ func (m *LinuxMounter) FormatAndMount(
 		fsType = DefaultFilesystemType
 	}
 	fsType = strings.ToLower(fsType)
-	if fsType != "ext4" && fsType != "xfs" {
+	if !IsSupportedFilesystemType(fsType) {
 		return fmt.Errorf("%w: %s (supported: ext4, xfs)", ErrUnsupportedFilesystem, fsType)
 	}
 
