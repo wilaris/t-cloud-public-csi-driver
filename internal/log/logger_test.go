@@ -71,7 +71,6 @@ func TestSanitizingLogger_RedactsMessageAndAttributes(t *testing.T) {
 
 	out := buf.String()
 
-	// Confirm secret values are masked
 	if strings.Contains(out, ak) {
 		t.Errorf("Log output contains unmasked OS_ACCESS_KEY value %q: %s", ak, out)
 	}
@@ -85,7 +84,6 @@ func TestSanitizingLogger_RedactsMessageAndAttributes(t *testing.T) {
 		t.Errorf("Log output contains unmasked Authorization token value: %s", out)
 	}
 
-	// Confirm masking string *** is present
 	if !strings.Contains(out, "***") {
 		t.Errorf("Log output missing expected *** mask: %s", out)
 	}
@@ -187,7 +185,6 @@ func TestNewLoggerFromEnv_InvalidLevelDoesNotPanic(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "invalid_garbage_level")
 
 	var buf bytes.Buffer
-	// Must not panic
 	logger := log.NewLoggerFromEnv(&buf)
 
 	logger.Info("info log with default level")
@@ -206,6 +203,26 @@ func TestRedactString_EdgeCases(t *testing.T) {
 	plain := "ordinary log message without credentials"
 	if log.RedactString(plain) != plain {
 		t.Errorf("RedactString modified plain string unexpectedly: %s", log.RedactString(plain))
+	}
+
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty value does not hide a later occurrence", "SK=,SK=x", "SK=,SK=***"},
+		{
+			"newline terminates the value",
+			"OS_SECRET_KEY=abc\nnext=line",
+			"OS_SECRET_KEY=***\nnext=line",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := log.RedactString(tc.input); got != tc.want {
+				t.Errorf("RedactString(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
 	}
 }
 

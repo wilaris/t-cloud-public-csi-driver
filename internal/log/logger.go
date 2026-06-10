@@ -69,8 +69,7 @@ func RedactAttr(a slog.Attr) slog.Attr {
 	}
 }
 
-// redactValue recursively inspects and redacts slog.Value kinds including strings, groups,
-// errors, and fmt.Stringers.
+// redactValue recursively redacts supported slog.Value kinds.
 func redactValue(val slog.Value) slog.Value {
 	switch val.Kind() {
 	case slog.KindString:
@@ -128,14 +127,15 @@ func maskKeyValues(s, prefix string) string {
 		valStart, valEnd := valueBounds(s, start)
 		if valEnd > valStart {
 			s = s[:valStart] + "***" + s[valEnd:]
+			idx = valStart + 3
+		} else {
+			idx = start
 		}
-		idx = idx + pos + len(prefix) + 3
 	}
 	return s
 }
 
-// valueBounds determines the start and end character offsets of a value token following a prefix,
-// skipping optional surrounding quotes or spaces.
+// Spaces and quotes after the prefix are excluded from the value.
 func valueBounds(s string, start int) (valStart, valEnd int) {
 	valStart = start
 	for valStart < len(s) && isQuoteOrSpace(s[valStart]) {
@@ -149,14 +149,12 @@ func valueBounds(s string, start int) (valStart, valEnd int) {
 	return valStart, valEnd
 }
 
-// isQuoteOrSpace returns true if byte b is a quote or whitespace character.
 func isQuoteOrSpace(b byte) bool {
 	return b == ' ' || b == '"' || b == '\''
 }
 
-// isTokenDelimiter returns true if byte b terminates a credential value token.
 func isTokenDelimiter(b byte) bool {
-	return b == ' ' || b == '"' || b == '\'' || b == '}' || b == ',' || b == ';'
+	return b == ' ' || b == '"' || b == '\'' || b == '}' || b == ',' || b == ';' || b == '\n'
 }
 
 // SanitizingHandler wraps an underlying slog.Handler to redact sensitive credentials.
@@ -164,12 +162,12 @@ type SanitizingHandler struct {
 	next slog.Handler
 }
 
-// NewSanitizingHandler constructs a new SanitizingHandler wrapping next.
+// NewSanitizingHandler adds credential redaction to next.
 func NewSanitizingHandler(next slog.Handler) slog.Handler {
 	return &SanitizingHandler{next: next}
 }
 
-// Enabled delegates to the underlying handler.
+// Enabled reports whether next accepts records at level.
 func (h *SanitizingHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return h.next.Enabled(ctx, level)
 }
@@ -196,7 +194,7 @@ func (h *SanitizingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &SanitizingHandler{next: h.next.WithAttrs(redacted)}
 }
 
-// WithGroup returns a new handler with the given group name.
+// WithGroup preserves redaction within the named group.
 func (h *SanitizingHandler) WithGroup(name string) slog.Handler {
 	return &SanitizingHandler{next: h.next.WithGroup(name)}
 }
