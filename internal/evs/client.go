@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"slices"
 	"strings"
+	"time"
 
 	golangsdk "github.com/opentelekomcloud/gophertelekomcloud"
 	"github.com/opentelekomcloud/gophertelekomcloud/openstack"
@@ -25,7 +28,6 @@ const (
 	EnvSecurityToken = "OS_SECURITY_TOKEN" //nolint:gosec // environment variable name constant
 )
 
-// Package-level error definitions for domain-level EVS operation classification.
 var (
 	// ErrNotFound indicates the target cloud resource was not found.
 	ErrNotFound = errors.New("cloud resource not found")
@@ -39,7 +41,7 @@ var (
 	ErrUnauthenticated = errors.New("cloud authentication failed")
 	// ErrPermissionDenied indicates authorization failure for the requested operation.
 	ErrPermissionDenied = errors.New("cloud authorization failed")
-	// ErrUnavailable indicates a transient or temporary cloud service unavailability.
+	// ErrUnavailable indicates a transient cloud service failure.
 	ErrUnavailable = errors.New("cloud service unavailable")
 	// ErrOperationFailed indicates a non-transient error or unexpected failure in cloud operations.
 	ErrOperationFailed = errors.New("cloud operation failed")
@@ -133,18 +135,16 @@ func NewProviderClient(cfg Config) (*golangsdk.ProviderClient, error) {
 	}
 
 	client.HTTPClient = http.Client{
-		Transport: client.HTTPClient.Transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("stopped after 10 redirects")
-			}
-			golangsdk.ReSign(req, golangsdk.SignOptions{
-				AccessKey: cfg.AccessKey,
-				SecretKey: cfg.SecretKey,
-			})
-			return nil
-		},
+		Transport:     &gatewayTransport{next: client.HTTPClient.Transport},
+		Timeout:       requestTimeout,
+		CheckRedirect: checkRedirect(cfg),
 	}
+
+	// Disable the SDK's uncancellable shared backoff; the CSI sidecar handles transient retries.
+	noBackoffRetries := 0
+	backoffTimeout := time.Duration(0)
+	client.MaxBackoffRetries = &noBackoffRetries
+	client.BackoffRetryTimeout = &backoffTimeout
 
 	if err := openstack.Authenticate(client, opts); err != nil {
 		return nil, fmt.Errorf(
@@ -165,23 +165,32 @@ func NewProviderClientFromEnv() (*golangsdk.ProviderClient, error) {
 	return NewProviderClient(cfg)
 }
 
-// sanitizeError removes credential values from error messages.
 func sanitizeError(err error, cfg Config) error {
 	if err == nil {
 		return nil
 	}
+	// Avoid exposing a rejected redirect URL from url.Error.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && errors.Is(urlErr.Err, errRedirectRefused) {
+		return urlErr.Err
+	}
+	// Redact longer secrets first to prevent partial replacement.
+	secrets := make([]string, 0, 3)
+	for _, secret := range []string{cfg.AccessKey, cfg.SecretKey, cfg.SecurityToken} {
+		if secret != "" {
+			secrets = append(secrets, secret)
+		}
+	}
+	slices.SortFunc(secrets, func(a, b string) int {
+		return len(b) - len(a)
+	})
+
 	msg := err.Error()
-	if cfg.AccessKey != "" {
-		msg = strings.ReplaceAll(msg, cfg.AccessKey, "[REDACTED]")
-	}
-	if cfg.SecretKey != "" {
-		msg = strings.ReplaceAll(msg, cfg.SecretKey, "[REDACTED]")
-	}
-	if cfg.SecurityToken != "" {
-		msg = strings.ReplaceAll(msg, cfg.SecurityToken, "[REDACTED]")
+	for _, secret := range secrets {
+		msg = strings.ReplaceAll(msg, secret, "[REDACTED]")
 	}
 	msg = log.RedactString(msg)
-	return fmt.Errorf("%s", msg)
+	return errors.New(msg)
 }
 
 // classifyError wraps an operation error with a domain sentinel error and redacts sensitive data.
@@ -198,32 +207,42 @@ func (c *Client) classifyError(operation string, err error) error {
 	return fmt.Errorf("%s: %w: %s", operation, kind, safeErr)
 }
 
-// classifyErrorKind maps SDK and system errors to package sentinel error categories.
+// classifyErrorKind returns only a sentinel so unsanitized SDK errors are not wrapped.
 func classifyErrorKind(err error) error {
 	var (
-		badRequest     golangsdk.ErrDefault400
-		unauthorized   golangsdk.ErrDefault401
-		forbidden      golangsdk.ErrDefault403
-		notFound       golangsdk.ErrDefault404
-		requestTimeout golangsdk.ErrDefault408
-		conflict       golangsdk.ErrDefault409
-		tooMany        golangsdk.ErrDefault429
-		serverError    golangsdk.ErrDefault500
-		unavailable    golangsdk.ErrDefault503
-		responseError  golangsdk.ErrUnexpectedResponseCode
-		networkError   net.Error
+		badRequest    golangsdk.ErrDefault400
+		unauthorized  golangsdk.ErrDefault401
+		forbidden     golangsdk.ErrDefault403
+		notFound      golangsdk.ErrDefault404
+		timedOut      golangsdk.ErrDefault408
+		conflict      golangsdk.ErrDefault409
+		tooMany       golangsdk.ErrDefault429
+		serverError   golangsdk.ErrDefault500
+		unavailable   golangsdk.ErrDefault503
+		responseError golangsdk.ErrUnexpectedResponseCode
+		networkError  net.Error
 	)
 
+	for _, sentinel := range []error{
+		ErrNotFound,
+		ErrConflict,
+		ErrInvalidArgument,
+		ErrNotOwned,
+		ErrUnauthenticated,
+		ErrPermissionDenied,
+		ErrUnavailable,
+		ErrOperationFailed,
+	} {
+		if errors.Is(err, sentinel) {
+			return sentinel
+		}
+	}
+
 	switch {
-	case errors.Is(err, ErrNotFound),
-		errors.Is(err, ErrConflict),
-		errors.Is(err, ErrInvalidArgument),
-		errors.Is(err, ErrNotOwned),
-		errors.Is(err, ErrUnauthenticated),
-		errors.Is(err, ErrPermissionDenied),
-		errors.Is(err, ErrUnavailable),
-		errors.Is(err, ErrOperationFailed):
-		return err
+	case errors.Is(err, errGatewayFailure):
+		return ErrUnavailable
+	case errors.Is(err, errRedirectRefused):
+		return ErrOperationFailed
 	case errors.As(err, &badRequest):
 		return ErrInvalidArgument
 	case errors.As(err, &unauthorized):
@@ -234,7 +253,7 @@ func classifyErrorKind(err error) error {
 		return ErrNotFound
 	case errors.As(err, &conflict):
 		return ErrConflict
-	case errors.As(err, &requestTimeout),
+	case errors.As(err, &timedOut),
 		errors.As(err, &tooMany),
 		errors.As(err, &serverError),
 		errors.As(err, &unavailable),

@@ -7,14 +7,16 @@ import (
 	"strings"
 	"time"
 
+	golangsdk "github.com/opentelekomcloud/gophertelekomcloud"
 	"github.com/opentelekomcloud/gophertelekomcloud/openstack/ecs/v1/cloudservers"
 	"github.com/opentelekomcloud/gophertelekomcloud/openstack/ecs/v1/disk"
 )
 
-const (
-	attachmentTimeout      = 10 * time.Minute
-	attachmentPollInterval = time.Second
-)
+const attachmentPollInterval = time.Second
+
+// detachKeepVolume tells disk.Detach to only detach; a nonzero delete flag would delete the
+// volume along with the attachment.
+const detachKeepVolume = 0
 
 // Attachment describes one observed attachment of an EVS volume to a compute instance.
 // DeviceName is required; the node cannot find the device without it.
@@ -29,16 +31,17 @@ func (c *Client) AttachVolume(
 	ctx context.Context,
 	volumeID, serverID string,
 ) (*Attachment, error) {
-	if err := c.validateAttachmentInput(volumeID, serverID); err != nil {
-		return nil, fmt.Errorf("attach volume %s to server %s: %w", volumeID, serverID, err)
+	operation := fmt.Sprintf("attach volume %s to server %s", volumeID, serverID)
+	if err := validateAttachmentInput(volumeID, serverID); err != nil {
+		return nil, fmt.Errorf("%s: %w", operation, err)
 	}
 
-	existing, err := c.observeAttachment(ctx, volumeID, serverID)
+	ctx, cancel := context.WithTimeout(ctx, maxOperationTimeout)
+	defer cancel()
+
+	existing, err := c.observeAttachment(ctx, c.ecs(ctx), volumeID, serverID)
 	if err != nil {
-		return nil, c.classifyError(
-			fmt.Sprintf("attach volume %s to server %s", volumeID, serverID),
-			err,
-		)
+		return nil, c.classifyError(operation, err)
 	}
 	if attachedWithDevice(existing) {
 		return existing, nil
@@ -47,15 +50,12 @@ func (c *Client) AttachVolume(
 		// Attached but device name not ready yet; wait for it.
 		attached, err := c.waitForAttachmentState(ctx, volumeID, serverID, attachedWithDevice)
 		if err != nil {
-			return nil, c.classifyError(
-				fmt.Sprintf("attach volume %s to server %s", volumeID, serverID),
-				err,
-			)
+			return nil, c.classifyError(operation, err)
 		}
 		return attached, nil
 	}
 
-	job, err := disk.Attach(c.ecsClient, disk.CreateOpts{
+	job, err := disk.Attach(c.ecs(ctx), disk.CreateOpts{
 		ServerID: serverID,
 		VolumeAttachment: &disk.VolumeAttachment{
 			VolumeID: volumeID,
@@ -73,37 +73,30 @@ func (c *Client) AttachVolume(
 			if observeErr == nil {
 				return attached, nil
 			}
+			// Prefer the context error when reconciliation is canceled or times out.
+			if ctx.Err() != nil {
+				return nil, c.classifyError(operation, ctx.Err())
+			}
 		}
-		return nil, c.classifyError(
-			fmt.Sprintf("attach volume %s to server %s", volumeID, serverID),
-			err,
-		)
+		return nil, c.classifyError(operation, err)
 	}
 	if job == nil || strings.TrimSpace(job.JobID) == "" {
 		attached, err := c.waitForAttachmentState(ctx, volumeID, serverID, attachedWithDevice)
 		if err == nil {
 			return attached, nil
 		}
-		return nil, fmt.Errorf(
-			"attach volume %s to server %s: %w",
-			volumeID,
-			serverID,
-			ErrOperationFailed,
-		)
+		if ctx.Err() != nil {
+			return nil, c.classifyError(operation, ctx.Err())
+		}
+		return nil, fmt.Errorf("%s: %w", operation, ErrOperationFailed)
 	}
 
 	if err := c.waitForAttachmentJob(ctx, job.JobID); err != nil {
-		return nil, c.classifyError(
-			fmt.Sprintf("attach volume %s to server %s", volumeID, serverID),
-			err,
-		)
+		return nil, c.classifyError(operation, err)
 	}
 	attached, err := c.waitForAttachmentState(ctx, volumeID, serverID, attachedWithDevice)
 	if err != nil {
-		return nil, c.classifyError(
-			fmt.Sprintf("attach volume %s to server %s", volumeID, serverID),
-			err,
-		)
+		return nil, c.classifyError(operation, err)
 	}
 
 	return attached, nil
@@ -111,22 +104,23 @@ func (c *Client) AttachVolume(
 
 // DetachVolume detaches an EVS volume from the compute instance identified by serverID.
 func (c *Client) DetachVolume(ctx context.Context, volumeID, serverID string) error {
-	if err := c.validateAttachmentInput(volumeID, serverID); err != nil {
-		return fmt.Errorf("detach volume %s from server %s: %w", volumeID, serverID, err)
+	operation := fmt.Sprintf("detach volume %s from server %s", volumeID, serverID)
+	if err := validateAttachmentInput(volumeID, serverID); err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
 	}
 
-	existing, err := c.observeAttachment(ctx, volumeID, serverID)
+	ctx, cancel := context.WithTimeout(ctx, maxOperationTimeout)
+	defer cancel()
+
+	existing, err := c.observeAttachment(ctx, c.ecs(ctx), volumeID, serverID)
 	if err != nil {
-		return c.classifyError(
-			fmt.Sprintf("detach volume %s from server %s", volumeID, serverID),
-			err,
-		)
+		return c.classifyError(operation, err)
 	}
 	if detached(existing) {
 		return nil
 	}
 
-	job, err := disk.Detach(c.ecsClient, serverID, volumeID, 0)
+	job, err := disk.Detach(c.ecs(ctx), serverID, volumeID, detachKeepVolume)
 	if err != nil {
 		kind := classifyErrorKind(err)
 		if errors.Is(kind, ErrUnavailable) || errors.Is(kind, ErrOperationFailed) {
@@ -139,67 +133,59 @@ func (c *Client) DetachVolume(ctx context.Context, volumeID, serverID string) er
 			if observeErr == nil {
 				return nil
 			}
+			// Prefer the context error when reconciliation is canceled or times out.
+			if ctx.Err() != nil {
+				return c.classifyError(operation, ctx.Err())
+			}
 		}
-		return c.classifyError(
-			fmt.Sprintf("detach volume %s from server %s", volumeID, serverID),
-			err,
-		)
+		return c.classifyError(operation, err)
 	}
 	if job == nil || strings.TrimSpace(job.JobID) == "" {
 		if _, err := c.waitForAttachmentState(ctx, volumeID, serverID, detached); err == nil {
 			return nil
 		}
-		return fmt.Errorf(
-			"detach volume %s from server %s: %w",
-			volumeID,
-			serverID,
-			ErrOperationFailed,
-		)
+		if ctx.Err() != nil {
+			return c.classifyError(operation, ctx.Err())
+		}
+		return fmt.Errorf("%s: %w", operation, ErrOperationFailed)
 	}
 
 	if err := c.waitForAttachmentJob(ctx, job.JobID); err != nil {
-		return c.classifyError(
-			fmt.Sprintf("detach volume %s from server %s", volumeID, serverID),
-			err,
-		)
+		return c.classifyError(operation, err)
 	}
 	if _, err := c.waitForAttachmentState(ctx, volumeID, serverID, detached); err != nil {
-		return c.classifyError(
-			fmt.Sprintf("detach volume %s from server %s", volumeID, serverID),
-			err,
-		)
+		return c.classifyError(operation, err)
 	}
 
 	return nil
 }
 
-// attachedWithDevice is true when DeviceName is set.
 func attachedWithDevice(attachment *Attachment) bool {
 	return attachment != nil && attachment.DeviceName != ""
 }
 
-// detached reports whether an observation shows the volume is no longer attached to the server.
 func detached(attachment *Attachment) bool {
 	return attachment == nil
 }
 
-// validateAttachmentInput verifies volumeID and serverID parameters are non-empty strings.
-func (c *Client) validateAttachmentInput(volumeID, serverID string) error {
+func validateAttachmentInput(volumeID, serverID string) error {
 	if strings.TrimSpace(volumeID) == "" || strings.TrimSpace(serverID) == "" {
 		return ErrInvalidArgument
 	}
 	return nil
 }
 
-// observeAttachment reads current attachment from ECS (nil if not attached).
+// observeAttachment returns the matching ECS attachment or nil if absent.
+// The client is reused across polling attempts.
 func (c *Client) observeAttachment(
 	ctx context.Context,
+	ecsClient *golangsdk.ServiceClient,
 	volumeID, serverID string,
 ) (*Attachment, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	attachments, err := disk.GetAttachments(c.ecsClient, serverID)
+	attachments, err := disk.GetAttachments(ecsClient, serverID)
 	if err != nil {
 		return nil, err
 	}
@@ -219,43 +205,63 @@ func (c *Client) observeAttachment(
 	return nil, nil
 }
 
-// waitForAttachmentJob polls an asynchronous attachment ECS job until completion using cloudservers.WaitForJobSuccess.
+// waitForAttachmentJob polls directly because the SDK helper does not support context cancellation
+// and starts a goroutine for each poll.
 func (c *Client) waitForAttachmentJob(
 	ctx context.Context,
 	jobID string,
 ) error {
-	var seconds int
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return context.DeadlineExceeded
-		}
-		seconds = int((remaining + time.Second - 1) / time.Second)
-	} else {
-		seconds = int(attachmentTimeout / time.Second)
-	}
+	jobClient := c.ecs(ctx)
 
-	if err := cloudservers.WaitForJobSuccess(c.ecsClient, seconds, jobID); err != nil {
-		if ctx.Err() != nil {
+	ticker := time.NewTicker(attachmentPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
 			return ctx.Err()
+		default:
 		}
-		return err
+
+		job := new(cloudservers.JobStatus)
+		//nolint:bodyclose // the SDK closes the response body when it decodes into the response value
+		if _, err := jobClient.Get(jobClient.ServiceURL("jobs", jobID), &job, nil); err != nil {
+			return err
+		}
+
+		if job.Status == "SUCCESS" {
+			return nil
+		}
+		if job.Status == "FAIL" {
+			return fmt.Errorf(
+				"ECS job %s failed (code %s): %s",
+				jobID,
+				job.ErrorCode,
+				job.FailReason,
+			)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
-	return nil
 }
 
-// waitForAttachmentState polls attachment status until settled accepts the observation, returning
-// that observation, or until the context expires.
+// waitForAttachmentState polls until settled accepts the observation or the context expires.
 func (c *Client) waitForAttachmentState(
 	ctx context.Context,
 	volumeID, serverID string,
 	settled func(*Attachment) bool,
 ) (*Attachment, error) {
+	ecsClient := c.ecs(ctx)
+
 	ticker := time.NewTicker(attachmentPollInterval)
 	defer ticker.Stop()
 
 	for {
-		attachment, err := c.observeAttachment(ctx, volumeID, serverID)
+		attachment, err := c.observeAttachment(ctx, ecsClient, volumeID, serverID)
 		if err == nil && settled(attachment) {
 			return attachment, nil
 		}

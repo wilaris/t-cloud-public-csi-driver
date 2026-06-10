@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -21,11 +22,8 @@ const (
 	// OwnershipTagValue is the fixed plugin identity recorded in the ownership tag.
 	OwnershipTagValue = "evs.csi.t-cloud.wilaris.dev"
 
-	// volumeAbsencePollInterval is the delay between deletion absence observations.
-	volumeAbsencePollInterval = 1 * time.Second
-	// volumeAbsenceMaxAttempts bounds deletion absence observation when the caller supplies no
-	// deadline of its own.
-	volumeAbsenceMaxAttempts = 60
+	volumeAbsencePollInterval = time.Second
+	volumeAbsenceMaxAttempts  = 60
 
 	// volumeListPageSize is the page size requested for a paged listing, so discovery does not
 	// depend on a server-chosen default.
@@ -34,17 +32,13 @@ const (
 	// unbounded number of pages.
 	volumeListMaxPages = 50
 
-	// volumeStatusAvailable is the EVS status of a volume that is provisioned and unattached.
-	volumeStatusAvailable = "available"
-	// volumeStatusInUse is the EVS status of a volume that is provisioned and attached.
-	volumeStatusInUse = "in-use"
-	// volumeStatusDeleting is the EVS status of a volume whose deletion is in progress.
-	volumeStatusDeleting = "deleting"
-	// volumeStatusErrorDeleting is the EVS status of a volume whose deletion failed terminally.
+	volumeStatusAvailable     = "available"
+	volumeStatusInUse         = "in-use"
+	volumeStatusDeleting      = "deleting"
 	volumeStatusErrorDeleting = "error_deleting"
 )
 
-// Volume represents a domain-level representation of an EVS volume.
+// Volume describes an EVS volume.
 type Volume struct {
 	ID               string            `json:"id"`
 	Name             string            `json:"name"`
@@ -57,9 +51,7 @@ type Volume struct {
 	Multiattach      bool              `json:"multiattach"`
 }
 
-// CreateVolumeOpts contains parameters for creating an EVS volume. It exposes no tag or metadata
-// field: the ownership marker is applied by CreateVolume itself and no caller value reaches EVS
-// volume metadata.
+// CreateVolumeOpts contains volume parameters. CreateVolume applies the ownership tag.
 type CreateVolumeOpts struct {
 	AvailabilityZone string `json:"availability_zone"`
 	VolumeType       string `json:"volume_type"`
@@ -79,8 +71,7 @@ type ListVolumeOpts struct {
 	Offset           int    `json:"offset,omitempty"`
 }
 
-// DiscoverVolumeOpts describes the volume a caller intends to create, so that an existing
-// driver-owned volume of the same name can be adopted instead of provisioning a duplicate.
+// DiscoverVolumeOpts describes the requested volume for same-name adoption.
 // MaxSizeGiB is an inclusive upper bound; zero means the caller declares no upper bound.
 type DiscoverVolumeOpts struct {
 	Name             string `json:"name"`
@@ -93,7 +84,6 @@ type DiscoverVolumeOpts struct {
 // Client manages EVS volume lifecycle operations.
 type Client struct {
 	cfg       Config
-	provider  *golangsdk.ProviderClient
 	v3Client  *golangsdk.ServiceClient
 	v2Client  *golangsdk.ServiceClient
 	ecsClient *golangsdk.ServiceClient
@@ -142,7 +132,6 @@ func NewClientFromProvider(provider *golangsdk.ProviderClient, cfg Config) (*Cli
 
 	return &Client{
 		cfg:       cfg,
-		provider:  provider,
 		v3Client:  v3Client,
 		v2Client:  v2Client,
 		ecsClient: ecsClient,
@@ -162,8 +151,11 @@ func NewClientWithServiceClients(
 	}
 }
 
-// CreateVolume creates a new EVS volume and polls job status until complete or context is cancelled.
+// CreateVolume creates an EVS volume and polls its job until completion or context cancellation.
 func (c *Client) CreateVolume(ctx context.Context, opts CreateVolumeOpts) (*Volume, error) {
+	ctx, cancel := context.WithTimeout(ctx, maxOperationTimeout)
+	defer cancel()
+
 	if ctx.Err() != nil {
 		return nil, c.classifyError("create volume", ctx.Err())
 	}
@@ -193,7 +185,7 @@ func (c *Client) CreateVolume(ctx context.Context, opts CreateVolumeOpts) (*Volu
 		Tags:             map[string]string{OwnershipTagKey: OwnershipTagValue},
 	}
 
-	res := v3volumes.Create(c.v3Client, createOpts)
+	res := v3volumes.Create(c.v3(ctx), createOpts)
 	if res.Err != nil {
 		return nil, c.classifyError("create volume", res.Err)
 	}
@@ -210,7 +202,9 @@ func (c *Client) CreateVolume(ctx context.Context, opts CreateVolumeOpts) (*Volu
 		return nil, c.classifyError("create volume: wait for job", err)
 	}
 
-	volIDInterface, err := v3volumes.GetJobEntity(c.v3Client, jobResp.JobID, "volume_id")
+	// If this lookup fails after the job succeeded, the created volume is orphaned: the
+	// caller receives an error without the volume ID and cannot reference or clean it up.
+	volIDInterface, err := v3volumes.GetJobEntity(c.v3(ctx), jobResp.JobID, "volume_id")
 	if err != nil {
 		return nil, c.classifyError("create volume: get job entity", err)
 	}
@@ -227,6 +221,9 @@ func (c *Client) CreateVolume(ctx context.Context, opts CreateVolumeOpts) (*Volu
 
 // GetVolume retrieves an EVS volume by ID.
 func (c *Client) GetVolume(ctx context.Context, id string) (*Volume, error) {
+	ctx, cancel := context.WithTimeout(ctx, maxOperationTimeout)
+	defer cancel()
+
 	if ctx.Err() != nil {
 		return nil, c.classifyError("get volume", ctx.Err())
 	}
@@ -234,7 +231,7 @@ func (c *Client) GetVolume(ctx context.Context, id string) (*Volume, error) {
 		return nil, fmt.Errorf("get volume: volume id cannot be empty: %w", ErrInvalidArgument)
 	}
 
-	res := v3volumes.Get(c.v3Client, id)
+	res := v3volumes.Get(c.v3(ctx), id)
 	v3Vol, err := res.Extract()
 	if err != nil {
 		return nil, c.classifyError(fmt.Sprintf("get volume %s", id), err)
@@ -247,12 +244,17 @@ func (c *Client) GetVolume(ctx context.Context, id string) (*Volume, error) {
 // Offset receives exactly that page. A caller that supplies neither receives every page within the
 // listing bound.
 func (c *Client) ListVolumes(ctx context.Context, opts ListVolumeOpts) ([]Volume, error) {
+	ctx, cancel := context.WithTimeout(ctx, maxOperationTimeout)
+	defer cancel()
+
 	if opts.Limit > 0 || opts.Offset > 0 {
 		return c.listVolumePage(ctx, opts)
 	}
 
+	// The bound counts non-empty pages; one extra fetch is allowed so a listing that ends
+	// exactly on the bound is confirmed by the empty page that terminates it.
 	var res []Volume
-	for range volumeListMaxPages {
+	for pages := 0; pages <= volumeListMaxPages; pages++ {
 		pageOpts := opts
 		pageOpts.Limit = volumeListPageSize
 		pageOpts.Offset = len(res)
@@ -288,7 +290,7 @@ func (c *Client) listVolumePage(ctx context.Context, opts ListVolumeOpts) ([]Vol
 		Offset:           opts.Offset,
 	}
 
-	v2Vols, err := cloudvolumes.List(c.v2Client, listOpts)
+	v2Vols, err := cloudvolumes.List(c.v2(ctx), listOpts)
 	if err != nil {
 		return nil, c.classifyError("list volumes", err)
 	}
@@ -301,10 +303,13 @@ func (c *Client) listVolumePage(ctx context.Context, opts ListVolumeOpts) ([]Vol
 }
 
 // DiscoverVolume returns the volume named by opts when this driver owns it and it satisfies the
-// requested availability zone, volume type, and size bounds. It returns ErrNotFound when no volume
-// carries that name, and ErrConflict when a same-name volume exists that this driver does not own or
-// cannot adopt. No candidate is modified.
+// requested availability zone, volume type and size bounds. It returns ErrNotFound when no volume
+// carries that name. It returns ErrConflict when a same-name volume exists that this driver does
+// not own or cannot adopt. No candidate is modified.
 func (c *Client) DiscoverVolume(ctx context.Context, opts DiscoverVolumeOpts) (*Volume, error) {
+	ctx, cancel := context.WithTimeout(ctx, maxOperationTimeout)
+	defer cancel()
+
 	if strings.TrimSpace(opts.Name) == "" {
 		return nil, fmt.Errorf("discover volume: name cannot be empty: %w", ErrInvalidArgument)
 	}
@@ -314,8 +319,7 @@ func (c *Client) DiscoverVolume(ctx context.Context, opts DiscoverVolumeOpts) (*
 		return nil, err
 	}
 
-	// The list surface filters by name on the server, but the exact-name set is recomputed here so
-	// that a fuzzy or ignored server filter cannot widen the candidate set.
+	// Verify exact names because server-side filtering may be fuzzy or ignored.
 	named := make([]Volume, 0, len(candidates))
 	for _, candidate := range candidates {
 		if candidate.Name == opts.Name {
@@ -326,8 +330,7 @@ func (c *Client) DiscoverVolume(ctx context.Context, opts DiscoverVolumeOpts) (*
 		return nil, fmt.Errorf("discover volume: no volume with that name: %w", ErrNotFound)
 	}
 
-	// Volume IDs are unique, so ordering by ID makes the adopted volume independent of cloud list
-	// order and keeps repeated calls for one name answering with the same volume.
+	// Sort by ID for deterministic adoption when names are duplicated.
 	slices.SortFunc(named, func(a, b Volume) int {
 		return strings.Compare(a.ID, b.ID)
 	})
@@ -346,7 +349,7 @@ func (c *Client) DiscoverVolume(ctx context.Context, opts DiscoverVolumeOpts) (*
 }
 
 // isAdoptable reports whether an existing volume carries the ownership marker and satisfies the
-// requested availability zone, volume type, size bounds, and an attachable status.
+// requested availability zone, volume type, size bounds and an attachable status.
 func isAdoptable(vol *Volume, opts DiscoverVolumeOpts) bool {
 	if vol.Tags[OwnershipTagKey] != OwnershipTagValue {
 		return false
@@ -369,12 +372,14 @@ func isAdoptable(vol *Volume, opts DiscoverVolumeOpts) bool {
 	return true
 }
 
-// DeleteVolume deletes a volume this driver owns and returns once its absence is observable. It
-// returns ErrNotOwned without issuing a destructive call when the volume carries no ownership
-// marker, and ErrNotFound when the volume is already absent. A deletion that is already in progress is
-// observed rather than requested again, and a deletion the cloud already reports as failed is reported
-// as a terminal failure.
+// DeleteVolume deletes a driver-owned volume and waits until it is absent. It returns ErrNotOwned
+// before issuing a destructive call when the ownership marker is missing and ErrNotFound when the
+// volume is absent. Existing deletions are polled without another request. A cloud-reported deletion
+// failure is terminal.
 func (c *Client) DeleteVolume(ctx context.Context, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, maxOperationTimeout)
+	defer cancel()
+
 	if ctx.Err() != nil {
 		return c.classifyError("delete volume", ctx.Err())
 	}
@@ -402,7 +407,7 @@ func (c *Client) DeleteVolume(ctx context.Context, id string) error {
 	case volumeStatusDeleting:
 		// A deletion is already in progress.
 	default:
-		res := blockstoragev3.Delete(c.v3Client, id)
+		res := blockstoragev3.Delete(c.v3(ctx), id)
 		if res.Err != nil {
 			return c.classifyError(fmt.Sprintf("delete volume %s", id), res.Err)
 		}
@@ -411,8 +416,7 @@ func (c *Client) DeleteVolume(ctx context.Context, id string) error {
 	return c.waitForVolumeAbsence(ctx, id)
 }
 
-// waitForVolumeAbsence polls until the cloud no longer reports the volume, bounding its own wait so
-// that an accepted delete call is never reported as a completed deletion.
+// waitForVolumeAbsence retries transient poll failures until the volume is absent or the attempt limit is reached.
 func (c *Client) waitForVolumeAbsence(ctx context.Context, id string) error {
 	ticker := time.NewTicker(volumeAbsencePollInterval)
 	defer ticker.Stop()
@@ -423,7 +427,13 @@ func (c *Client) waitForVolumeAbsence(ctx context.Context, id string) error {
 			return nil
 		}
 		if err != nil {
-			return err
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			kind := classifyErrorKind(err)
+			if !errors.Is(kind, ErrUnavailable) && !errors.Is(kind, ErrOperationFailed) {
+				return err
+			}
 		}
 		if attempt == volumeAbsenceMaxAttempts-1 {
 			break
@@ -444,11 +454,15 @@ func (c *Client) waitForVolumeAbsence(ctx context.Context, id string) error {
 
 // waitForJobSuccess polls job status until SUCCESS or FAIL, respecting context cancellation.
 func (c *Client) waitForJobSuccess(ctx context.Context, jobID string) error {
-	jobClient := *c.v3Client
-	jobClient.Endpoint = strings.Replace(jobClient.Endpoint, "v3", "v1", 1)
-	jobClient.ResourceBase = jobClient.Endpoint
+	jobClient := *c.v3(ctx)
+	jobEndpoint, err := jobStatusEndpoint(jobClient.Endpoint)
+	if err != nil {
+		return err
+	}
+	jobClient.Endpoint = jobEndpoint
+	jobClient.ResourceBase = jobEndpoint
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -459,6 +473,7 @@ func (c *Client) waitForJobSuccess(ctx context.Context, jobID string) error {
 		}
 
 		job := new(v3volumes.JobStatus)
+		//nolint:bodyclose // the SDK closes the response body when it decodes into the response value
 		_, err := jobClient.Get(jobClient.ServiceURL("jobs", jobID), &job, nil)
 		if err != nil {
 			return err
@@ -484,7 +499,26 @@ func (c *Client) waitForJobSuccess(ctx context.Context, jobID string) error {
 	}
 }
 
-// mapV3VolumeToDomain maps an OpenStack BlockStorage v3 volume struct to a domain Volume.
+// jobStatusEndpoint rewrites a block storage v3 endpoint to the v1 endpoint that serves job
+// status. Only the leading "/v3/" path segment is replaced; a "v3" anywhere else in the URL
+// (host, port, prefix) must be left untouched.
+func jobStatusEndpoint(endpoint string) (string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("wait for job: parse endpoint: %w: %s", ErrOperationFailed, err)
+	}
+	rest, ok := strings.CutPrefix(u.Path, "/v3/")
+	if !ok {
+		return "", fmt.Errorf(
+			"wait for job: endpoint path %q does not start with /v3/: %w",
+			u.Path,
+			ErrOperationFailed,
+		)
+	}
+	u.Path = "/v1/" + rest
+	return u.String(), nil
+}
+
 func mapV3VolumeToDomain(v *v3volumes.Volume) *Volume {
 	if v == nil {
 		return nil
@@ -510,7 +544,6 @@ func mapV3VolumeToDomain(v *v3volumes.Volume) *Volume {
 	}
 }
 
-// mapV2VolumeToDomain maps an OpenStack CloudVolume v2 struct to a domain Volume.
 func mapV2VolumeToDomain(v *cloudvolumes.Volume) Volume {
 	metadata := make(map[string]string)
 	if v.Metadata.SystemCmkID != "" {
