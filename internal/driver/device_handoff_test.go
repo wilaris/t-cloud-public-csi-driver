@@ -102,7 +102,7 @@ func TestControllerPublishVolume_PublishesOnlyTheReportedDevicePath(t *testing.T
 			client := newControllerClient(t, svc)
 
 			resp, err := client.ControllerPublishVolume(
-				context.Background(),
+				t.Context(),
 				&csi.ControllerPublishVolumeRequest{
 					VolumeId: volumeID,
 					NodeId:   serverUUID,
@@ -167,7 +167,7 @@ func TestControllerPublishVolume_RepublishesTheSameDevicePath(t *testing.T) {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
 	client := newControllerClient(t, svc)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	vol, err := cloud.CreateVolume(ctx, evs.CreateVolumeOpts{
 		Name:             "republished-volume",
@@ -244,7 +244,7 @@ func TestNodeService_AcceptsACompleteSerialLinkOnEmulatedHost(t *testing.T) {
 		client := newEmulatedNodeClient(t, host)
 
 		stagingPath := filepath.Join(host.dir, "staging")
-		if _, err := client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		if _, err := client.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 			VolumeId:          emulatedVolumeID,
 			StagingTargetPath: stagingPath,
 			PublishContext:    host.publishContext(),
@@ -278,7 +278,7 @@ func TestNodeService_AcceptsACompleteSerialLinkOnEmulatedHost(t *testing.T) {
 		client := newEmulatedNodeClient(t, host)
 
 		stagingPath := filepath.Join(host.dir, "staging")
-		if _, err := client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+		if _, err := client.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 			VolumeId:          emulatedVolumeID,
 			StagingTargetPath: stagingPath,
 			PublishContext:    host.publishContext(),
@@ -307,7 +307,7 @@ func TestNodeService_AcceptsACompleteSerialLinkOnEmulatedHost(t *testing.T) {
 		client := newEmulatedNodeClient(t, host)
 
 		targetPath := filepath.Join(host.dir, "block-target", "device")
-		if _, err := client.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		if _, err := client.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 			VolumeId:          emulatedVolumeID,
 			StagingTargetPath: filepath.Join(host.dir, "block-staging"),
 			TargetPath:        targetPath,
@@ -362,7 +362,7 @@ func TestNodePublishVolume_RequiresThePublishedDevicePathForRawBlock(t *testing.
 
 			dir := t.TempDir()
 			targetPath := filepath.Join(dir, "block-target", "device")
-			_, err = client.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+			_, err = client.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 				VolumeId:          emulatedVolumeID,
 				StagingTargetPath: filepath.Join(dir, "block-staging"),
 				TargetPath:        targetPath,
@@ -487,7 +487,7 @@ func TestNodeStageVolume_UnverifiedDeviceOnEmulatedHost(t *testing.T) {
 			publishContext := tt.prepare(t, host)
 
 			stagingPath := filepath.Join(host.dir, "staging")
-			_, err := client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+			_, err := client.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 				VolumeId:          emulatedVolumeID,
 				StagingTargetPath: stagingPath,
 				PublishContext:    publishContext,
@@ -517,7 +517,7 @@ func TestNodePublishVolume_UnverifiedRawBlockDeviceOnEmulatedHost(t *testing.T) 
 			publishContext := tt.prepare(t, host)
 
 			targetPath := filepath.Join(host.dir, "block-target", "device")
-			_, err := client.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+			_, err := client.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 				VolumeId:          emulatedVolumeID,
 				StagingTargetPath: filepath.Join(host.dir, "block-staging"),
 				TargetPath:        targetPath,

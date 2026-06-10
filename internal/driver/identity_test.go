@@ -1,7 +1,6 @@
 package driver_test
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -74,7 +73,7 @@ func TestIdentityService_GRPC_GetPluginInfo(t *testing.T) {
 
 	client := newIdentityClient(t, svc)
 
-	res, err := client.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
+	res, err := client.GetPluginInfo(t.Context(), &csi.GetPluginInfoRequest{})
 	if err != nil {
 		t.Fatalf("GetPluginInfo failed: %v", err)
 	}
@@ -99,7 +98,7 @@ func TestIdentityService_GRPC_GetPluginCapabilities(t *testing.T) {
 	client := newIdentityClient(t, svc)
 
 	res, err := client.GetPluginCapabilities(
-		context.Background(),
+		t.Context(),
 		&csi.GetPluginCapabilitiesRequest{},
 	)
 	if err != nil {
@@ -145,7 +144,7 @@ func TestIdentityService_GRPC_Probe(t *testing.T) {
 
 	client := newIdentityClient(t, svc)
 
-	res, err := client.Probe(context.Background(), &csi.ProbeRequest{})
+	res, err := client.Probe(t.Context(), &csi.ProbeRequest{})
 	if err != nil {
 		t.Fatalf("Probe failed: %v", err)
 	}
@@ -159,7 +158,7 @@ func TestIdentityService_Direct_GetPluginInfo_InvalidState(t *testing.T) {
 	t.Parallel()
 
 	svc := &driver.IdentityService{}
-	_, err := svc.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
+	_, err := svc.GetPluginInfo(t.Context(), &csi.GetPluginInfoRequest{})
 	if err == nil {
 		t.Fatal("expected error for uninitialized IdentityService")
 	}
@@ -178,7 +177,7 @@ func TestIdentityService_GRPC_StatusMapping_Uninitialized(t *testing.T) {
 
 	client := newIdentityClient(t, &driver.IdentityService{})
 
-	_, err := client.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
+	_, err := client.GetPluginInfo(t.Context(), &csi.GetPluginInfoRequest{})
 	if err == nil {
 		t.Fatal("expected gRPC error for uninitialized IdentityService over wire")
 	}
@@ -203,7 +202,7 @@ func TestIdentityService_GRPC_CSISpecCompliance(t *testing.T) {
 
 	client := newIdentityClient(t, svc)
 
-	info, err := client.GetPluginInfo(context.Background(), &csi.GetPluginInfoRequest{})
+	info, err := client.GetPluginInfo(t.Context(), &csi.GetPluginInfoRequest{})
 	if err != nil {
 		t.Fatalf("GetPluginInfo failed: %v", err)
 	}
@@ -230,7 +229,7 @@ func TestIdentityService_GRPC_CSISpecCompliance(t *testing.T) {
 		t.Fatal("CSI spec requirement violation: vendor_version must not be empty")
 	}
 
-	probeRes, err := client.Probe(context.Background(), &csi.ProbeRequest{})
+	probeRes, err := client.Probe(t.Context(), &csi.ProbeRequest{})
 	if err != nil {
 		t.Fatalf("Probe failed: %v", err)
 	}

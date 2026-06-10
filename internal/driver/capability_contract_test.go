@@ -151,7 +151,7 @@ func probeCapability(
 	t.Helper()
 
 	cfg := validTestConfig()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	evsClient := newMockEVSClient()
 	vol, err := evsClient.CreateVolume(ctx, evs.CreateVolumeOpts{
@@ -571,7 +571,7 @@ func TestControllerConflictCarriesTheStatusOfItsOperation(t *testing.T) {
 	t.Parallel()
 
 	cfg := validTestConfig()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	svc, err := driver.NewControllerService(conflictEVSClient{}, cfg)
 	if err != nil {
@@ -705,7 +705,7 @@ func TestDeleteVolume_RejectsAVolumeWithoutTheOwnershipMarker(t *testing.T) {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
 
-	_, err = svc.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{
+	_, err = svc.DeleteVolume(t.Context(), &csi.DeleteVolumeRequest{
 		VolumeId: "vol-unmarked",
 	})
 
@@ -723,7 +723,7 @@ func TestValidateVolumeCapabilities_EchoesEveryConfirmedField(t *testing.T) {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	vol, err := client.CreateVolume(ctx, evs.CreateVolumeOpts{
 		Name:             "echo-vol",
 		Size:             10,
@@ -797,7 +797,7 @@ func TestValidateVolumeCapabilities_UnconfirmedWithoutError(t *testing.T) {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	vol, err := client.CreateVolume(ctx, evs.CreateVolumeOpts{
 		Name:             "unconfirmed-vol",
 		Size:             10,
@@ -879,7 +879,7 @@ func TestNodeCapabilitySetCoversEveryAcceptedAccessMode(t *testing.T) {
 	}
 
 	resp, err := newNodeClient(t, svc).NodeGetCapabilities(
-		context.Background(),
+		t.Context(),
 		&csi.NodeGetCapabilitiesRequest{},
 	)
 	if err != nil {

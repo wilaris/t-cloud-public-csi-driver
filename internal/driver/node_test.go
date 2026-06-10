@@ -168,7 +168,7 @@ func TestNodeService_NodeGetInfo(t *testing.T) {
 
 	client := newNodeClient(t, svc)
 
-	res, err := client.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
+	res, err := client.NodeGetInfo(t.Context(), &csi.NodeGetInfoRequest{})
 	if err != nil {
 		t.Fatalf("NodeGetInfo failed: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestNodeService_NodeGetCapabilities(t *testing.T) {
 	client := newNodeClient(t, svc)
 
 	res, err := client.NodeGetCapabilities(
-		context.Background(),
+		t.Context(),
 		&csi.NodeGetCapabilitiesRequest{},
 	)
 	if err != nil {
@@ -252,7 +252,7 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 	client := newNodeClient(t, svc)
 
 	// 1. Missing volume ID
-	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+	_, err = client.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 		StagingTargetPath: stagingPath,
 		VolumeCapability:  mountCapability(""),
 	})
@@ -261,7 +261,7 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 	}
 
 	// 2. Device not found
-	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+	_, err = client.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-missing",
 		StagingTargetPath: stagingPath,
 		PublishContext:    attachedPublishContext(),
@@ -272,7 +272,7 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 	}
 
 	// 3. Successful Mount Access Stage
-	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+	_, err = client.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: stagingPath,
 		PublishContext:    attachedPublishContext(),
@@ -287,7 +287,7 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 
 	// 4. Successful Block Access Stage
 	blockStagingPath := filepath.Join(tmpDir, "block-staging")
-	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+	_, err = client.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: blockStagingPath,
 		PublishContext:    attachedPublishContext(),
@@ -325,13 +325,13 @@ func TestNodeService_NodeUnstageVolume(t *testing.T) {
 	client := newNodeClient(t, svc)
 
 	// Missing parameters
-	_, err = client.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{})
+	_, err = client.NodeUnstageVolume(t.Context(), &csi.NodeUnstageVolumeRequest{})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Errorf("expected InvalidArgument for empty req, got: %v", err)
 	}
 
 	// Success unstage
-	_, err = client.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+	_, err = client.NodeUnstageVolume(t.Context(), &csi.NodeUnstageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: stagingPath,
 	})
@@ -395,7 +395,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 	client := newNodeClient(t, svc)
 
 	// 1. Invalid access mode
-	_, err = client.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+	_, err = client.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: stagingPath,
 		TargetPath:        targetPath,
@@ -413,7 +413,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 	}
 
 	// 2. Successful Mount Publish bind mounts the staged directory without formatting it.
-	_, err = client.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+	_, err = client.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: stagingPath,
 		TargetPath:        targetPath,
@@ -444,7 +444,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 	// 3. A read-only request adds the ro option.
 	roTargetPath := filepath.Join(tmpDir, "target-ro")
 	mounts = nil
-	_, err = client.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+	_, err = client.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: stagingPath,
 		TargetPath:        roTargetPath,
@@ -467,7 +467,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 
 	// 4. Publishing a volume that was never staged is a precondition failure.
 	mounts = nil
-	_, err = client.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+	_, err = client.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: filepath.Join(tmpDir, "unstaged"),
 		TargetPath:        filepath.Join(tmpDir, "target-unstaged"),
@@ -483,7 +483,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 	// 5. Successful Block Publish bind mounts the device itself.
 	blockTargetPath := filepath.Join(tmpDir, "block-target", "file.raw")
 	mounts = nil
-	_, err = client.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+	_, err = client.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: stagingPath,
 		TargetPath:        blockTargetPath,
@@ -541,13 +541,13 @@ func TestNodeService_NodeUnpublishVolume(t *testing.T) {
 	client := newNodeClient(t, svc)
 
 	// Invalid input
-	_, err = client.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{})
+	_, err = client.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Errorf("expected InvalidArgument for empty req, got: %v", err)
 	}
 
 	// Successful unpublish
-	_, err = client.NodeUnpublishVolume(context.Background(), &csi.NodeUnpublishVolumeRequest{
+	_, err = client.NodeUnpublishVolume(t.Context(), &csi.NodeUnpublishVolumeRequest{
 		VolumeId:   "vol-123",
 		TargetPath: targetPath,
 	})
@@ -588,7 +588,7 @@ func TestNodeService_ErrorHandling(t *testing.T) {
 	client := newNodeClient(t, svc)
 
 	// Format and mount error returns Internal code
-	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+	_, err = client.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: filepath.Join(tmpDir, "stage-err"),
 		PublishContext:    attachedPublishContext(),
@@ -599,7 +599,7 @@ func TestNodeService_ErrorHandling(t *testing.T) {
 	}
 
 	// Bind mount error returns Internal code
-	_, err = client.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+	_, err = client.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: filepath.Join(tmpDir, "stage-ok"),
 		TargetPath:        filepath.Join(tmpDir, "publish-err"),
@@ -610,7 +610,7 @@ func TestNodeService_ErrorHandling(t *testing.T) {
 	}
 
 	// Unmount error returns Internal code
-	_, err = client.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+	_, err = client.NodeUnstageVolume(t.Context(), &csi.NodeUnstageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: filepath.Join(tmpDir, "unstage-err"),
 	})
@@ -675,7 +675,7 @@ func TestNodeService_DeviceDiscoveryFromPublishContext(t *testing.T) {
 
 			client := newNodeClient(t, svc)
 
-			_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+			_, err = client.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 				VolumeId:          "vol-123",
 				StagingTargetPath: filepath.Join(tmpDir, "staging-"+tt.name),
 				PublishContext:    tt.publishContext,
@@ -723,7 +723,7 @@ func TestNodeService_DeviceIdentityMismatch(t *testing.T) {
 	}
 	client := newNodeClient(t, svc)
 
-	_, err = client.NodeStageVolume(context.Background(), &csi.NodeStageVolumeRequest{
+	_, err = client.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
 		VolumeId:          "vol-123",
 		StagingTargetPath: filepath.Join(t.TempDir(), "staging"),
 		PublishContext:    attachedPublishContext(),

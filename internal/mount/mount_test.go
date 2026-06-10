@@ -107,7 +107,7 @@ func newDeviceTree(t *testing.T) (*LinuxMounter, string, string, string) {
 
 func TestDiscoverDevice(t *testing.T) {
 	mounter, _, byIDDir, device := newDeviceTree(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	volID := "vol-12345678"
 	link := filepath.Join(byIDDir, "virtio-"+volID)
@@ -153,7 +153,7 @@ func TestDiscoverDeviceTruncatedVirtioSerial(t *testing.T) {
 		t.Fatalf("failed to link the attached device: %v", err)
 	}
 
-	found, err := mounter.DiscoverDevice(context.Background(), volumeID, device)
+	found, err := mounter.DiscoverDevice(t.Context(), volumeID, device)
 	if err != nil {
 		t.Fatalf("expected discovery via an agreeing truncated serial, got: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestDiscoverDeviceRejectsDisagreeingIdentity(t *testing.T) {
 		t.Fatalf("failed to link the other device: %v", err)
 	}
 
-	_, err := mounter.DiscoverDevice(context.Background(), volID, device)
+	_, err := mounter.DiscoverDevice(t.Context(), volID, device)
 	if !errors.Is(err, ErrDeviceIdentityUnverified) {
 		t.Errorf("expected ErrDeviceIdentityUnverified, got: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestDiscoverDeviceRejectsPathOutsideDeviceDirectory(t *testing.T) {
 		t.Fatalf("failed to write outside file: %v", err)
 	}
 
-	_, err := mounter.DiscoverDevice(context.Background(), volID, outside)
+	_, err := mounter.DiscoverDevice(t.Context(), volID, outside)
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Errorf("expected ErrInvalidInput for a path outside %s, got: %v", devDir, err)
 	}
@@ -212,7 +212,7 @@ func TestDiscoverDeviceRejectsAbsentPublishedPath(t *testing.T) {
 		t.Fatalf("failed to link the attached device: %v", err)
 	}
 
-	_, err := mounter.DiscoverDevice(context.Background(), volID, filepath.Join(devDir, "vdz"))
+	_, err := mounter.DiscoverDevice(t.Context(), volID, filepath.Join(devDir, "vdz"))
 	if !errors.Is(err, ErrDeviceNotFound) {
 		t.Errorf("expected ErrDeviceNotFound for an absent published path, got: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestDiscoverDeviceRejectsAbsentPublishedPath(t *testing.T) {
 func TestGetFilesystemType(t *testing.T) {
 	fe := newFakeExec()
 	mounter := NewLinuxMounter(WithExecInterface(fe))
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Empty source
 	_, err := mounter.GetFilesystemType(ctx, "")
@@ -291,7 +291,7 @@ func TestMount(t *testing.T) {
 		WithMountUtilsInterface(fakeMounter),
 		WithExecInterface(fe),
 	)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Input validation
 	if err := mounter.Mount(ctx, "", targetPath, "", []string{"bind"}); !errors.Is(
@@ -341,7 +341,7 @@ func TestMount(t *testing.T) {
 	}
 
 	// Canceled context returns context.Canceled.
-	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancelledCtx, cancel := context.WithCancel(t.Context())
 	cancel()
 	err := mounter.Mount(cancelledCtx, "/dev/sdb", filepath.Join(tmpDir, "other"), "", nil)
 	if !errors.Is(err, context.Canceled) {
@@ -365,7 +365,7 @@ func TestIsMountPointAndGetMountSource(t *testing.T) {
 	})
 
 	mounter := NewLinuxMounter(WithMountUtilsInterface(fakeMounter))
-	ctx := context.Background()
+	ctx := t.Context()
 
 	mounted, err := mounter.IsMountPoint(ctx, targetPath)
 	if err != nil || !mounted {
@@ -407,7 +407,7 @@ func TestFormatAndMount(t *testing.T) {
 		WithMountUtilsInterface(fakeMounter),
 		WithExecInterface(fe),
 	)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Unsupported filesystem test
 	err := mounter.FormatAndMount(ctx, devPath, targetDir, "btrfs", nil)
@@ -503,7 +503,7 @@ func TestSupportedFilesystemAgreement(t *testing.T) {
 		)
 
 		err := mounter.FormatAndMount(
-			context.Background(),
+			t.Context(),
 			"/dev/sdb",
 			filepath.Join(tmpDir, fmt.Sprintf("agree-target-%d", i)),
 			name,
@@ -537,7 +537,7 @@ func TestUnmount(t *testing.T) {
 	})
 
 	mounter := NewLinuxMounter(WithMountUtilsInterface(fakeMounter))
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Successful unmount
 	err := mounter.Unmount(ctx, targetPath)

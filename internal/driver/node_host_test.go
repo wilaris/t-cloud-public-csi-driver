@@ -177,7 +177,7 @@ func TestNodeService_MountedVolumeLifecycleOnEmulatedHost(t *testing.T) {
 
 	host := newEmulatedHost(t)
 	client := newEmulatedNodeClient(t, host)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stagingPath := filepath.Join(host.dir, "staging")
 	targetPath := filepath.Join(host.dir, "target")
@@ -313,7 +313,7 @@ func TestNodeService_RawBlockVolumeLifecycleOnEmulatedHost(t *testing.T) {
 
 	host := newEmulatedHost(t)
 	client := newEmulatedNodeClient(t, host)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stagingPath := filepath.Join(host.dir, "block-staging")
 	targetPath := filepath.Join(host.dir, "block-target", "device")
@@ -413,7 +413,7 @@ func TestNodeService_PublishFailureLeavesNoTargetOnEmulatedHost(t *testing.T) {
 
 	host := newEmulatedHost(t)
 	client := newEmulatedNodeClient(t, host)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	unstagedTarget := filepath.Join(host.dir, "unstaged-target")
 	_, err := client.NodePublishVolume(ctx, &csi.NodePublishVolumeRequest{
@@ -455,7 +455,7 @@ func TestNodeService_UnpublishReportsRemainingMountOnEmulatedHost(t *testing.T) 
 
 	host := newEmulatedHost(t)
 	client := newEmulatedNodeClient(t, host)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stagingPath := filepath.Join(host.dir, "staging")
 	targetPath := filepath.Join(host.dir, "target")
@@ -527,7 +527,7 @@ func TestNodeService_NodeGetInfoReportsNodeIDFromFlags(t *testing.T) {
 
 	client := newNodeClient(t, svc)
 
-	res, err := client.NodeGetInfo(context.Background(), &csi.NodeGetInfoRequest{})
+	res, err := client.NodeGetInfo(t.Context(), &csi.NodeGetInfoRequest{})
 	if err != nil {
 		t.Fatalf("NodeGetInfo failed: %v", err)
 	}

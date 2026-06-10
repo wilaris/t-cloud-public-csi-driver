@@ -1,7 +1,6 @@
 package evs_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -41,7 +40,7 @@ func TestAttachVolume_Validation(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			attachment, err := client.AttachVolume(
-				context.Background(),
+				t.Context(),
 				tc.volumeID,
 				tc.serverID,
 			)
@@ -90,7 +89,7 @@ func TestDetachVolume_Validation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := client.DetachVolume(context.Background(), tc.volumeID, tc.serverID)
+			err := client.DetachVolume(t.Context(), tc.volumeID, tc.serverID)
 			if err == nil {
 				t.Fatalf("expected error for %s, got nil", tc.name)
 			}
