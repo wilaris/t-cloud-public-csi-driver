@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -18,6 +20,7 @@ import (
 	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
 	"wilaris.dev/t-cloud-public-csi-driver/internal/driver"
 	"wilaris.dev/t-cloud-public-csi-driver/internal/mount"
+	"wilaris.dev/t-cloud-public-csi-driver/internal/mount/mounttest"
 )
 
 // emulatedVolumeID is long enough that udev truncates the virtio by-id serial.
@@ -81,7 +84,7 @@ func (e *hostExec) countCalls(prefix string) int {
 	return count
 }
 
-// emulatedHost is a fake node: mount table, /dev + by-id and canned blkid/mkfs.
+// emulatedHost is a fake node: mount table, /dev + by-id and canned host commands.
 type emulatedHost struct {
 	mounter    *mount.LinuxMounter
 	table      *mountutils.FakeMounter
@@ -118,6 +121,8 @@ func newEmulatedHost(t *testing.T) *emulatedHost {
 		t.Fatalf("failed to link the attached device: %v", err)
 	}
 
+	table := mountutils.NewFakeMounter(nil)
+
 	hostCommands := &hostExec{
 		handlers: map[string]func(args ...string) ([]byte, error){
 			// Freshly attached EVS volume has no filesystem yet.
@@ -127,8 +132,8 @@ func newEmulatedHost(t *testing.T) *emulatedHost {
 			"mkfs.xfs":  func(_ ...string) ([]byte, error) { return []byte("done"), nil },
 		},
 	}
-
-	table := mountutils.NewFakeMounter(nil)
+	// Mount effects run through exec; keep the emulated mount table coherent.
+	maps.Copy(hostCommands.handlers, mounttest.Commands(table))
 
 	return &emulatedHost{
 		mounter: mount.NewLinuxMounter(
@@ -136,6 +141,8 @@ func newEmulatedHost(t *testing.T) *emulatedHost {
 			mount.WithExecInterface(hostCommands),
 			mount.WithDevDir(devDir),
 			mount.WithDiskByIDDir(byIDDir),
+			// Plain rw source flags so bind options do not inherit the host tmpfs mounts.
+			mount.WithStatfsFunc(mounttest.StaticStatfs(0)),
 		),
 		table:      table,
 		exec:       hostCommands,
@@ -238,6 +245,10 @@ func TestNodeService_MountedVolumeLifecycleOnEmulatedHost(t *testing.T) {
 	if !hasOption(published.Opts, "bind") {
 		t.Errorf("expected a bind mount at the target, got options %v", published.Opts)
 	}
+	// Publish options must be only what the request set (plain source adds none).
+	if want := []string{"bind", "remount"}; !slices.Equal(published.Opts, want) {
+		t.Errorf("expected the published options %v, got %v", want, published.Opts)
+	}
 
 	accessible, err := host.mounter.IsMountPoint(ctx, targetPath)
 	if err != nil || !accessible {
@@ -296,7 +307,7 @@ func TestNodeService_MountedVolumeLifecycleOnEmulatedHost(t *testing.T) {
 		t.Errorf("node teardown removed the attached device: %v", err)
 	}
 
-	// Teardown of an already torn down volume must stay successful and stay clean.
+	// Idempotent teardown stays clean.
 	if _, err := client.NodeUnpublishVolume(ctx, unpublish); err != nil {
 		t.Errorf("repeated NodeUnpublishVolume failed: %v", err)
 	}
