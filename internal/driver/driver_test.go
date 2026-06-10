@@ -11,7 +11,6 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/driver"
 )
 
 const bufSize = 1024 * 1024
@@ -54,7 +53,7 @@ func serveCSI(t *testing.T, register func(*grpc.Server)) *grpc.ClientConn {
 }
 
 // newIdentityClient serves svc as the CSI Identity service and returns a client for it.
-func newIdentityClient(t *testing.T, svc *driver.IdentityService) csi.IdentityClient {
+func newIdentityClient(t *testing.T, svc csi.IdentityServer) csi.IdentityClient {
 	t.Helper()
 
 	return csi.NewIdentityClient(serveCSI(t, func(server *grpc.Server) {
@@ -63,7 +62,7 @@ func newIdentityClient(t *testing.T, svc *driver.IdentityService) csi.IdentityCl
 }
 
 // newControllerClient serves svc as the CSI Controller service and returns a client for it.
-func newControllerClient(t *testing.T, svc *driver.ControllerService) csi.ControllerClient {
+func newControllerClient(t *testing.T, svc csi.ControllerServer) csi.ControllerClient {
 	t.Helper()
 
 	return csi.NewControllerClient(serveCSI(t, func(server *grpc.Server) {
@@ -72,7 +71,7 @@ func newControllerClient(t *testing.T, svc *driver.ControllerService) csi.Contro
 }
 
 // newNodeClient serves svc as the CSI Node service and returns a client for it.
-func newNodeClient(t *testing.T, svc *driver.NodeService) csi.NodeClient {
+func newNodeClient(t *testing.T, svc csi.NodeServer) csi.NodeClient {
 	t.Helper()
 
 	return csi.NewNodeClient(serveCSI(t, func(server *grpc.Server) {
