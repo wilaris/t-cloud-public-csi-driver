@@ -7,94 +7,6 @@ import (
 	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
-func TestLoadConfig_ValidEnv(t *testing.T) {
-	env := map[string]string{
-		evs.EnvAuthURL:       "https://iam.eu-de.otc.t-systems.com/v3",
-		evs.EnvAccessKey:     "test-access-key",
-		evs.EnvSecretKey:     "test-secret-key",
-		evs.EnvProjectID:     "1234567890abcdef1234567890abcdef",
-		evs.EnvRegionName:    "eu-de",
-		evs.EnvSecurityToken: "test-security-token",
-	}
-
-	cfg, err := evs.LoadConfig(func(key string) string {
-		return env[key]
-	})
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-
-	if cfg.AuthURL != env[evs.EnvAuthURL] {
-		t.Errorf("AuthURL = %q, want %q", cfg.AuthURL, env[evs.EnvAuthURL])
-	}
-	if cfg.AccessKey != env[evs.EnvAccessKey] {
-		t.Errorf("AccessKey = %q, want %q", cfg.AccessKey, env[evs.EnvAccessKey])
-	}
-	if cfg.SecretKey != env[evs.EnvSecretKey] {
-		t.Errorf("SecretKey = %q, want %q", cfg.SecretKey, env[evs.EnvSecretKey])
-	}
-	if cfg.ProjectID != env[evs.EnvProjectID] {
-		t.Errorf("ProjectID = %q, want %q", cfg.ProjectID, env[evs.EnvProjectID])
-	}
-	if cfg.RegionName != env[evs.EnvRegionName] {
-		t.Errorf("RegionName = %q, want %q", cfg.RegionName, env[evs.EnvRegionName])
-	}
-	if cfg.SecurityToken != env[evs.EnvSecurityToken] {
-		t.Errorf("SecurityToken = %q, want %q", cfg.SecurityToken, env[evs.EnvSecurityToken])
-	}
-}
-
-func TestLoadConfig_MissingRequiredEnv(t *testing.T) {
-	required := []string{
-		evs.EnvAuthURL,
-		evs.EnvAccessKey,
-		evs.EnvSecretKey,
-		evs.EnvProjectID,
-		evs.EnvRegionName,
-	}
-
-	baseEnv := map[string]string{
-		evs.EnvAuthURL:    "https://iam.eu-de.otc.t-systems.com/v3",
-		evs.EnvAccessKey:  "test-access-key",
-		evs.EnvSecretKey:  "test-secret-key",
-		evs.EnvProjectID:  "1234567890abcdef1234567890abcdef",
-		evs.EnvRegionName: "eu-de",
-	}
-
-	for _, missingKey := range required {
-		t.Run("missing_"+missingKey, func(t *testing.T) {
-			cfg, err := evs.LoadConfig(func(key string) string {
-				if key == missingKey {
-					return ""
-				}
-				return baseEnv[key]
-			})
-			if err == nil {
-				t.Fatalf("expected error for missing %s, got nil (cfg: %+v)", missingKey, cfg)
-			}
-			if !strings.Contains(err.Error(), missingKey) {
-				t.Errorf("expected error message to mention %s, got %q", missingKey, err.Error())
-			}
-		})
-	}
-}
-
-func TestLoadConfig_UnacceptedAuthMethodsAndAliasesNotSupported(t *testing.T) {
-	unacceptedEnv := map[string]string{
-		"OS_USERNAME":    "test-user",
-		"OS_PASSWORD":    "test-pass",
-		"OS_TENANT_NAME": "test-tenant",
-		"OS_DOMAIN_NAME": "test-domain",
-	}
-
-	cfg, err := evs.LoadConfig(func(key string) string {
-		return unacceptedEnv[key]
-	})
-	if err == nil {
-		t.Fatalf("expected LoadConfig to fail when required AK/SK vars are missing, got: %+v", cfg)
-	}
-}
-
 func TestNewProviderClient_MissingRequiredConfig(t *testing.T) {
 	cfg := evs.Config{
 		AuthURL:    "https://iam.eu-de.otc.t-systems.com/v3",
@@ -103,7 +15,7 @@ func TestNewProviderClient_MissingRequiredConfig(t *testing.T) {
 		RegionName: "eu-de",
 	}
 
-	client, err := evs.NewProviderClient(cfg)
+	client, err := evs.NewProviderClient(t.Context(), cfg)
 	if err == nil {
 		t.Fatalf(
 			"expected NewProviderClient to fail with missing SecretKey, got client: %v",
@@ -126,7 +38,7 @@ func TestNewProviderClient_SecretContainment(t *testing.T) {
 		SecurityToken: secretToken,
 	}
 
-	_, err := evs.NewProviderClient(cfg)
+	_, err := evs.NewProviderClient(t.Context(), cfg)
 	if err == nil {
 		t.Fatal("expected error for invalid AuthURL, got nil")
 	}

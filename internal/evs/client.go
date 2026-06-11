@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -17,15 +16,6 @@ import (
 	"github.com/opentelekomcloud/gophertelekomcloud/openstack"
 
 	"wilaris.dev/t-cloud-public-csi-driver/internal/log"
-)
-
-const (
-	EnvAuthURL       = "OS_AUTH_URL"
-	EnvAccessKey     = "OS_ACCESS_KEY"
-	EnvSecretKey     = "OS_SECRET_KEY" //nolint:gosec // environment variable name constant
-	EnvProjectID     = "OS_PROJECT_ID"
-	EnvRegionName    = "OS_REGION_NAME"
-	EnvSecurityToken = "OS_SECURITY_TOKEN" //nolint:gosec // environment variable name constant
 )
 
 var (
@@ -47,7 +37,7 @@ var (
 	ErrOperationFailed = errors.New("cloud operation failed")
 )
 
-// Config holds validated AK/SK authentication credentials and target cloud settings.
+// Config is validated AK/SK auth and cloud target settings (caller validates).
 type Config struct {
 	AuthURL       string
 	AccessKey     string
@@ -57,62 +47,8 @@ type Config struct {
 	SecurityToken string
 }
 
-// LoadConfigFromEnv reads and validates EVS credentials from process environment variables.
-func LoadConfigFromEnv() (Config, error) {
-	return LoadConfig(os.Getenv)
-}
-
-// LoadConfig reads and validates EVS credentials using a custom environment lookup function.
-func LoadConfig(getenv func(string) string) (Config, error) {
-	if getenv == nil {
-		getenv = os.Getenv
-	}
-
-	cfg := Config{
-		AuthURL:       strings.TrimSpace(getenv(EnvAuthURL)),
-		AccessKey:     strings.TrimSpace(getenv(EnvAccessKey)),
-		SecretKey:     strings.TrimSpace(getenv(EnvSecretKey)),
-		ProjectID:     strings.TrimSpace(getenv(EnvProjectID)),
-		RegionName:    strings.TrimSpace(getenv(EnvRegionName)),
-		SecurityToken: strings.TrimSpace(getenv(EnvSecurityToken)),
-	}
-
-	if cfg.AuthURL == "" {
-		return Config{}, fmt.Errorf(
-			"missing or empty required environment variable %s",
-			EnvAuthURL,
-		)
-	}
-	if cfg.AccessKey == "" {
-		return Config{}, fmt.Errorf(
-			"missing or empty required environment variable %s",
-			EnvAccessKey,
-		)
-	}
-	if cfg.SecretKey == "" {
-		return Config{}, fmt.Errorf(
-			"missing or empty required environment variable %s",
-			EnvSecretKey,
-		)
-	}
-	if cfg.ProjectID == "" {
-		return Config{}, fmt.Errorf(
-			"missing or empty required environment variable %s",
-			EnvProjectID,
-		)
-	}
-	if cfg.RegionName == "" {
-		return Config{}, fmt.Errorf(
-			"missing or empty required environment variable %s",
-			EnvRegionName,
-		)
-	}
-
-	return cfg, nil
-}
-
 // NewProviderClient constructs an authenticated, project- and region-scoped ProviderClient.
-func NewProviderClient(cfg Config) (*golangsdk.ProviderClient, error) {
+func NewProviderClient(ctx context.Context, cfg Config) (*golangsdk.ProviderClient, error) {
 	if cfg.AuthURL == "" || cfg.AccessKey == "" || cfg.SecretKey == "" || cfg.ProjectID == "" ||
 		cfg.RegionName == "" {
 		return nil, fmt.Errorf("invalid configuration: required fields missing")
@@ -134,13 +70,15 @@ func NewProviderClient(cfg Config) (*golangsdk.ProviderClient, error) {
 		)
 	}
 
+	// Authenticate under the caller's context so shutdown can abort the exchange.
+	gateway := &gatewayTransport{next: client.HTTPClient.Transport}
 	client.HTTPClient = http.Client{
-		Transport:     &gatewayTransport{next: client.HTTPClient.Transport},
+		Transport:     &contextTransport{ctx: ctx, next: gateway},
 		Timeout:       requestTimeout,
 		CheckRedirect: checkRedirect(cfg),
 	}
 
-	// Disable the SDK's uncancellable shared backoff; the CSI sidecar handles transient retries.
+	// Disable the SDK's shared backoff; the CSI sidecar handles transient retries.
 	noBackoffRetries := 0
 	backoffTimeout := time.Duration(0)
 	client.MaxBackoffRetries = &noBackoffRetries
@@ -153,16 +91,10 @@ func NewProviderClient(cfg Config) (*golangsdk.ProviderClient, error) {
 		)
 	}
 
-	return client, nil
-}
+	// Clear the startup context from the shared provider so later calls use their own ctx.
+	client.HTTPClient.Transport = gateway
 
-// NewProviderClientFromEnv loads configuration from process environment and creates a ProviderClient.
-func NewProviderClientFromEnv() (*golangsdk.ProviderClient, error) {
-	cfg, err := LoadConfigFromEnv()
-	if err != nil {
-		return nil, err
-	}
-	return NewProviderClient(cfg)
+	return client, nil
 }
 
 func sanitizeError(err error, cfg Config) error {
@@ -193,13 +125,21 @@ func sanitizeError(err error, cfg Config) error {
 	return errors.New(msg)
 }
 
-// classifyError wraps an operation error with a domain sentinel error and redacts sensitive data.
+// classifyError maps err to a domain sentinel and redacts secrets in the text.
 func (c *Client) classifyError(operation string, err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("%s: %w", operation, err)
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("%s: %w: %s", operation, context.Canceled, sanitizeError(err, c.cfg))
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf(
+			"%s: %w: %s",
+			operation,
+			context.DeadlineExceeded,
+			sanitizeError(err, c.cfg),
+		)
 	}
 
 	kind := classifyErrorKind(err)
@@ -207,7 +147,7 @@ func (c *Client) classifyError(operation string, err error) error {
 	return fmt.Errorf("%s: %w: %s", operation, kind, safeErr)
 }
 
-// classifyErrorKind returns only a sentinel so unsanitized SDK errors are not wrapped.
+// classifyErrorKind returns a sentinel only; it does not wrap the raw SDK error.
 func classifyErrorKind(err error) error {
 	var (
 		badRequest    golangsdk.ErrDefault400
@@ -256,8 +196,10 @@ func classifyErrorKind(err error) error {
 	case errors.As(err, &timedOut),
 		errors.As(err, &tooMany),
 		errors.As(err, &serverError),
-		errors.As(err, &unavailable),
-		errors.As(err, &networkError):
+		errors.As(err, &unavailable):
+		return ErrUnavailable
+	// Network timeouts are transient; other net.Error values (refused, DNS) are terminal.
+	case errors.As(err, &networkError) && networkError.Timeout():
 		return ErrUnavailable
 	case errors.As(err, &responseError):
 		if responseError.Actual == http.StatusBadGateway ||

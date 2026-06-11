@@ -21,6 +21,28 @@ func (s sampleAuthConfig) String() string {
 	return fmt.Sprintf("sampleAuthConfig{AK:%s, SK:%s}", s.OS_ACCESS_KEY, s.OS_SECRET_KEY)
 }
 
+// sampleAuthError is an error whose message embeds a secret (value receiver; typed nil panics if called).
+type sampleAuthError struct {
+	OS_SECRET_KEY string
+}
+
+func (s sampleAuthError) Error() string {
+	return fmt.Sprintf("sampleAuthError{SK:%s}", s.OS_SECRET_KEY)
+}
+
+// deferredAuthConfig is a slog.LogValuer that only exposes credentials when resolved.
+type deferredAuthConfig struct {
+	accessKey string
+	secretKey string
+}
+
+func (d deferredAuthConfig) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("OS_ACCESS_KEY", d.accessKey),
+		slog.String("OS_SECRET_KEY", d.secretKey),
+	)
+}
+
 func TestParseLevel(t *testing.T) {
 	t.Parallel()
 
@@ -141,6 +163,54 @@ func TestSanitizingLogger_RedactsStringifiedStructs(t *testing.T) {
 	}
 }
 
+func TestSanitizingLogger_RedactsDeferredValues(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	logger := log.NewLogger(&buf, slog.LevelInfo)
+
+	logger.Info("initializing client", slog.Any("config", deferredAuthConfig{
+		accessKey: "deferredAK123",
+		secretKey: "deferredSK456",
+	}))
+
+	out := buf.String()
+	if strings.Contains(out, "deferredAK123") {
+		t.Errorf("Log output contains unmasked AK from a deferred value: %s", out)
+	}
+	if strings.Contains(out, "deferredSK456") {
+		t.Errorf("Log output contains unmasked SK from a deferred value: %s", out)
+	}
+	if !strings.Contains(out, "***") {
+		t.Errorf("Log output missing *** mask for a deferred value: %s", out)
+	}
+}
+
+func TestSanitizingLogger_TypedNilValueDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		value any
+	}{
+		{name: "a typed nil satisfying fmt.Stringer", value: (*sampleAuthConfig)(nil)},
+		{name: "a typed nil satisfying error", value: (*sampleAuthError)(nil)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := log.NewLogger(&buf, slog.LevelInfo)
+
+			logger.Info("initializing client", slog.Any("config", tc.value))
+
+			if out := buf.String(); !strings.Contains(out, "initializing client") {
+				t.Errorf("Log output missing the record: %s", out)
+			}
+		})
+	}
+}
+
 func TestSanitizingLogger_WithAttrsAndGroup(t *testing.T) {
 	t.Parallel()
 
@@ -216,6 +286,17 @@ func TestRedactString_EdgeCases(t *testing.T) {
 			"OS_SECRET_KEY=abc\nnext=line",
 			"OS_SECRET_KEY=***\nnext=line",
 		},
+		{
+			"a key ending a longer word leaves its value intact",
+			"mount failed on DISK: /dev/sda1",
+			"mount failed on DISK: /dev/sda1",
+		},
+		{"SK at the end of TASK is not the key", "TASK: reconcile", "TASK: reconcile"},
+		{"AK at the end of BREAK is not the key", "BREAK: now", "BREAK: now"},
+		{"a bare key masks its value", "AK=abc", "AK=***"},
+		{"a key opening the text masks", "OS_SECRET_KEY=abc", "OS_SECRET_KEY=***"},
+		{"an underscore-prefixed name masks", "MY_OS_SECRET_KEY=abc", "MY_OS_SECRET_KEY=***"},
+		{"a dash-prefixed name masks", "X-OS_SECRET_KEY=abc", "X-OS_SECRET_KEY=***"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

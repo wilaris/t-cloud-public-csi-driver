@@ -1,7 +1,11 @@
 package config_test
 
 import (
+	"errors"
+	"flag"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -30,6 +34,7 @@ func TestParseSuccess(t *testing.T) {
 
 	env := validEnvMap()
 	args := []string{
+		"--role", "controller",
 		"--nodeid", "68e1a123-4567-89ab-cdef-0123456789ab",
 		"--endpoint", "unix:///tmp/csi.sock",
 		"--driver-name", "my-custom-driver",
@@ -93,7 +98,7 @@ func TestParseDefaultFlags(t *testing.T) {
 	t.Parallel()
 
 	env := validEnvMap()
-	args := []string{"--nodeid", "node-uuid-123"}
+	args := []string{"--role", "controller", "--nodeid", "node-uuid-123"}
 
 	cfg, err := config.Parse(args, mockGetenv(env))
 	if err != nil {
@@ -111,18 +116,20 @@ func TestParseDefaultFlags(t *testing.T) {
 	}
 }
 
-func TestMissingNodeID(t *testing.T) {
+func TestUnacceptedAuthMethodsAndAliasesNotSupported(t *testing.T) {
 	t.Parallel()
 
-	env := validEnvMap()
-	args := []string{} // missing --nodeid
-
-	_, err := config.Parse(args, mockGetenv(env))
-	if err == nil {
-		t.Fatal("expected error for missing --nodeid, got nil")
+	unacceptedEnv := map[string]string{
+		"OS_USERNAME":    "test-user",
+		"OS_PASSWORD":    "test-pass",
+		"OS_TENANT_NAME": "test-tenant",
+		"OS_DOMAIN_NAME": "test-domain",
 	}
-	if !strings.Contains(err.Error(), "--nodeid") {
-		t.Errorf("expected error message to mention --nodeid, got: %v", err)
+	args := []string{"--role", "controller"}
+
+	cfg, err := config.Parse(args, mockGetenv(unacceptedEnv))
+	if err == nil {
+		t.Fatalf("expected parse to fail when required AK/SK vars are missing, got: %+v", cfg)
 	}
 }
 
@@ -136,18 +143,74 @@ func TestInvalidEndpoint(t *testing.T) {
 		{"invalid scheme", "http://localhost/socket"},
 		{"missing scheme", "/var/lib/kubelet/csi.sock"},
 		{"empty endpoint", ""},
+		{"unix endpoint with host segment", "unix://var/lib/kubelet/csi.sock"},
+		{"unix endpoint with traversal", "unix:///var/lib/../csi.sock"},
+		{"tcp endpoint without host", "tcp://"},
+		{"tcp endpoint with path", "tcp://127.0.0.1:9000/csi"},
+		{"unix endpoint with query", "unix:///run/csi.sock?mode=0600"},
+		{"unix endpoint with fragment", "unix:///run/csi.sock#main"},
+		{"tcp endpoint with user information", "tcp://user@127.0.0.1:9000"},
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			env := validEnvMap()
-			args := []string{"--nodeid", "node-uuid-123", "--endpoint", tc.endpoint}
+			args := []string{
+				"--role",
+				"controller",
+				"--nodeid",
+				"node-uuid-123",
+				"--endpoint",
+				tc.endpoint,
+			}
 
 			_, err := config.Parse(args, mockGetenv(env))
 			if err == nil {
 				t.Fatalf("expected error for endpoint %q, got nil", tc.endpoint)
+			}
+		})
+	}
+}
+
+func TestNetworkResolvesWhatTheListenerBinds(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name        string
+		endpoint    string
+		wantNetwork string
+		wantAddress string
+	}{
+		{
+			"unix endpoint",
+			"unix:///var/lib/kubelet/plugins/csi.sock",
+			"unix",
+			"/var/lib/kubelet/plugins/csi.sock",
+		},
+		{"tcp endpoint", "tcp://127.0.0.1:9000", "tcp", "127.0.0.1:9000"},
+		{"tcp endpoint on all interfaces", "tcp://0.0.0.0:9000", "tcp", "0.0.0.0:9000"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			args := []string{"--role", "controller", "--endpoint", tc.endpoint}
+
+			cfg, err := config.Parse(args, mockGetenv(validEnvMap()))
+			if err != nil {
+				t.Fatalf("expected endpoint %q to parse, got %v", tc.endpoint, err)
+			}
+
+			network, address, err := cfg.Network()
+			if err != nil {
+				t.Fatalf("Network() failed: %v", err)
+			}
+			if network != tc.wantNetwork {
+				t.Errorf("expected network %q, got %q", tc.wantNetwork, network)
+			}
+			if address != tc.wantAddress {
+				t.Errorf("expected address %q, got %q", tc.wantAddress, address)
 			}
 		})
 	}
@@ -165,12 +228,11 @@ func TestMissingRequiredEnvVars(t *testing.T) {
 	}
 
 	for _, reqVar := range requiredVars {
-		reqVar := reqVar
 		t.Run("missing_"+reqVar, func(t *testing.T) {
 			t.Parallel()
 			env := validEnvMap()
 			delete(env, reqVar)
-			args := []string{"--nodeid", "node-uuid-123"}
+			args := []string{"--role", "controller", "--nodeid", "node-uuid-123"}
 
 			_, err := config.Parse(args, mockGetenv(env))
 			if err == nil {
@@ -188,7 +250,7 @@ func TestInvalidAuthURL(t *testing.T) {
 
 	env := validEnvMap()
 	env[config.EnvAuthURL] = "not-a-url"
-	args := []string{"--nodeid", "node-uuid-123"}
+	args := []string{"--role", "controller", "--nodeid", "node-uuid-123"}
 
 	_, err := config.Parse(args, mockGetenv(env))
 	if err == nil {
@@ -228,7 +290,7 @@ func TestConfigStringRedaction(t *testing.T) {
 	t.Parallel()
 
 	env := validEnvMap()
-	args := []string{"--nodeid", "node-uuid-123"}
+	args := []string{"--role", "controller", "--nodeid", "node-uuid-123"}
 
 	cfg, err := config.Parse(args, mockGetenv(env))
 	if err != nil {
@@ -267,7 +329,7 @@ func TestErrorOutputDoesNotLeakSecrets(t *testing.T) {
 	// Intentionally trigger validation error by giving invalid AuthURL
 	env[config.EnvAuthURL] = "http://invalid auth url"
 
-	args := []string{"--nodeid", "node-uuid-123"}
+	args := []string{"--role", "controller", "--nodeid", "node-uuid-123"}
 
 	_, err := config.Parse(args, mockGetenv(env))
 	if err == nil {
@@ -280,5 +342,70 @@ func TestErrorOutputDoesNotLeakSecrets(t *testing.T) {
 	}
 	if strings.Contains(errMsg, secretSK) {
 		t.Errorf("error output leaked SecretKey secret value! Error: %s", errMsg)
+	}
+}
+
+// captureStderr swaps process stderr for a pipe and returns what is written after fn runs.
+// Not safe for parallel use; callers must not mark their tests parallel.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create stderr pipe: %v", err)
+	}
+
+	original := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = original }()
+
+	fn()
+
+	_ = w.Close()
+	os.Stderr = original
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read captured stderr: %v", err)
+	}
+	return string(out)
+}
+
+func TestFlagParseFailureReportsOnlyThroughTheError(t *testing.T) {
+	// Not parallel: captures process stderr.
+	var parseErr error
+	out := captureStderr(t, func() {
+		_, parseErr = config.Parse(
+			[]string{"--role", "controller", "--bogus-flag"},
+			mockGetenv(validEnvMap()),
+		)
+	})
+
+	if parseErr == nil {
+		t.Fatal("expected a parse error for an unknown flag, got nil")
+	}
+	if errors.Is(parseErr, flag.ErrHelp) {
+		t.Errorf("an unknown flag must not be reported as a help request: %v", parseErr)
+	}
+	if !strings.Contains(parseErr.Error(), "bogus-flag") {
+		t.Errorf("expected the parse error to name the unknown flag, got: %v", parseErr)
+	}
+	if out != "" {
+		t.Errorf("parse failure wrote to stderr: %q", out)
+	}
+}
+
+func TestFlagHelpRequestPrintsUsage(t *testing.T) {
+	// Not parallel: captures process stderr.
+	var parseErr error
+	out := captureStderr(t, func() {
+		_, parseErr = config.Parse([]string{"--help"}, mockGetenv(validEnvMap()))
+	})
+
+	if !errors.Is(parseErr, flag.ErrHelp) {
+		t.Fatalf("expected a help request to surface flag.ErrHelp, got: %v", parseErr)
+	}
+	if !strings.Contains(out, "Usage") {
+		t.Errorf("expected a help request to print usage, got: %q", out)
 	}
 }

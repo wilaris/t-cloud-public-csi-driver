@@ -89,9 +89,9 @@ type Client struct {
 	ecsClient *golangsdk.ServiceClient
 }
 
-// NewClient constructs a Client from a validated Config.
-func NewClient(cfg Config) (*Client, error) {
-	provider, err := NewProviderClient(cfg)
+// NewClient authenticates and returns a Client. ctx bounds authentication only.
+func NewClient(ctx context.Context, cfg Config) (*Client, error) {
+	provider, err := NewProviderClient(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -240,9 +240,8 @@ func (c *Client) GetVolume(ctx context.Context, id string) (*Volume, error) {
 	return mapV3VolumeToDomain(v3Vol), nil
 }
 
-// ListVolumes lists EVS volumes matching the given criteria. A caller that supplies its own Limit or
-// Offset receives exactly that page. A caller that supplies neither receives every page within the
-// listing bound.
+// ListVolumes lists volumes matching opts. With Limit or Offset set, returns that page only;
+// otherwise pages until exhausted or volumeListMaxPages.
 func (c *Client) ListVolumes(ctx context.Context, opts ListVolumeOpts) ([]Volume, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxOperationTimeout)
 	defer cancel()
@@ -302,10 +301,8 @@ func (c *Client) listVolumePage(ctx context.Context, opts ListVolumeOpts) ([]Vol
 	return res, nil
 }
 
-// DiscoverVolume returns the volume named by opts when this driver owns it and it satisfies the
-// requested availability zone, volume type and size bounds. It returns ErrNotFound when no volume
-// carries that name. It returns ErrConflict when a same-name volume exists that this driver does
-// not own or cannot adopt. No candidate is modified.
+// DiscoverVolume returns a driver-owned volume matching opts for same-name adoption.
+// ErrNotFound if none; ErrConflict if a same-name volume exists but is not adoptable.
 func (c *Client) DiscoverVolume(ctx context.Context, opts DiscoverVolumeOpts) (*Volume, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxOperationTimeout)
 	defer cancel()
@@ -348,8 +345,7 @@ func (c *Client) DiscoverVolume(ctx context.Context, opts DiscoverVolumeOpts) (*
 	)
 }
 
-// isAdoptable reports whether an existing volume carries the ownership marker and satisfies the
-// requested availability zone, volume type, size bounds and an attachable status.
+// isAdoptable reports whether vol can be adopted for opts.
 func isAdoptable(vol *Volume, opts DiscoverVolumeOpts) bool {
 	if vol.Tags[OwnershipTagKey] != OwnershipTagValue {
 		return false
@@ -447,7 +443,7 @@ func (c *Client) waitForVolumeAbsence(ctx context.Context, id string) error {
 	}
 
 	return fmt.Errorf(
-		"delete volume: absence was not observable within the deletion bound: %w",
+		"delete volume: volume still present after polling: %w",
 		ErrOperationFailed,
 	)
 }

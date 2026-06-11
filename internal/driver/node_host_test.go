@@ -514,18 +514,12 @@ func TestNodeService_NodeGetInfoReportsNodeIDFromFlags(t *testing.T) {
 
 	const serverUUID = "9f0a1b2c-3d4e-5f60-7182-93a4b5c6d7e8"
 	const zone = "eu-de-01"
+	const region = "eu-de"
 
-	env := map[string]string{
-		config.EnvAuthURL:    "https://iam.example.com/v3",
-		config.EnvAccessKey:  "test-ak",
-		config.EnvSecretKey:  "test-sk",
-		config.EnvProjectID:  "test-project-id",
-		config.EnvRegionName: "eu-de",
-	}
-
+	// The node role reads no cloud environment, so an empty lookup must still parse cleanly.
 	cfg, err := config.Parse(
-		[]string{"--nodeid", serverUUID, "--availability-zone", zone},
-		func(key string) string { return env[key] },
+		[]string{"--role", "node", "--nodeid", serverUUID, "--availability-zone", zone},
+		func(string) string { return "" },
 	)
 	if err != nil {
 		t.Fatalf("config.Parse failed: %v", err)
@@ -552,7 +546,7 @@ func TestNodeService_NodeGetInfoReportsNodeIDFromFlags(t *testing.T) {
 	if gotZone != zone {
 		t.Errorf("expected zone topology %q, got %q", zone, gotZone)
 	}
-	if gotZone == env[config.EnvRegionName] {
+	if gotZone == region {
 		t.Errorf("node reported region %q as its zone topology", gotZone)
 	}
 }

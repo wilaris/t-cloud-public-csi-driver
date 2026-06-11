@@ -11,9 +11,7 @@ import (
 )
 
 const (
-	// requestTimeout bounds one HTTP request end to end, including the response body. It is set on
-	// the provider's HTTP client, so it also bounds the startup authentication exchange, which has
-	// no caller context to inherit.
+	// requestTimeout bounds one HTTP request including the response body.
 	requestTimeout = 60 * time.Second
 	// maxOperationTimeout bounds one exported operation in total, including every request, job
 	// wait and state poll it performs. A shorter caller deadline is preserved.
@@ -34,7 +32,6 @@ type contextTransport struct {
 	next http.RoundTripper
 }
 
-// RoundTrip applies the caller context.
 func (t *contextTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	next := t.next
 	if next == nil {
@@ -121,7 +118,7 @@ func checkRedirect(cfg Config) func(*http.Request, []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
 		if len(via) > maxRedirects {
 			return fmt.Errorf(
-				"%w: the redirect bound of %d was reached",
+				"%w: exceeded %d redirects",
 				errRedirectRefused,
 				maxRedirects,
 			)
@@ -130,7 +127,7 @@ func checkRedirect(cfg Config) func(*http.Request, []*http.Request) error {
 		previous := via[len(via)-1]
 		if req.URL.Scheme != previous.URL.Scheme || req.URL.Host != previous.URL.Host {
 			return fmt.Errorf(
-				"%w: the hop leaves the configured cloud endpoint",
+				"%w: cross-origin redirect",
 				errRedirectRefused,
 			)
 		}

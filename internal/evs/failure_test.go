@@ -12,7 +12,7 @@ import (
 	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
-func TestReconciliationCutShortByCancellationIsReportedAsCancellation(t *testing.T) {
+func TestCancelDuringReconcileReportsCanceled(t *testing.T) {
 	cases := []struct {
 		name string
 		// observation is returned by every attachment poll.
@@ -88,7 +88,7 @@ func TestReconciliationCutShortByCancellationIsReportedAsCancellation(t *testing
 	}
 }
 
-func TestTransientCloudStatusesSurfaceWithoutASecondRequest(t *testing.T) {
+func TestTransientStatusNotRetried(t *testing.T) {
 	cases := []struct {
 		name   string
 		status int
@@ -148,14 +148,14 @@ func TestDeletionToleratesATransientPollFailure(t *testing.T) {
 	}
 }
 
-func TestAClassifiedErrorCarriesOnlyASentinelAndSanitizedText(t *testing.T) {
+func TestClassifiedErrorSentinelAndRedactedText(t *testing.T) {
 	// One secret contains the other, which is what makes replacement order observable.
 	cfg := stubConfig()
 	cfg.AccessKey = "QQQQ1234"
 	cfg.SecretKey = "QQQQ"
 
 	inspected := fmt.Errorf(
-		"cloud detail %s and %s: %w",
+		"cloud detail %s and %s on DISK: /dev/sda1: %w",
 		cfg.AccessKey,
 		cfg.SecretKey,
 		evs.ErrConflict,
@@ -180,5 +180,64 @@ func TestAClassifiedErrorCarriesOnlyASentinelAndSanitizedText(t *testing.T) {
 	}
 	if strings.Contains(message, "1234") {
 		t.Fatalf("returned message contains part of an overlapping secret: %s", message)
+	}
+	if !strings.Contains(message, "/dev/sda1") {
+		t.Fatalf("expected the device path to survive redaction, got: %s", message)
+	}
+}
+
+func TestCanceledErrorRedactsSecrets(t *testing.T) {
+	cfg := stubConfig()
+	cfg.SecretKey = "QQQQ"
+
+	inspected := fmt.Errorf("cloud detail %s: %w", cfg.SecretKey, context.Canceled)
+	transport := newStubTransport(scriptedAnswer{err: inspected})
+	client := newStubClient(t, cfg, transport)
+
+	_, err := client.GetVolume(t.Context(), stubVolumeID)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the reported cause to be cancellation, got: %v", err)
+	}
+	if strings.Contains(err.Error(), cfg.SecretKey) {
+		t.Fatalf("cancellation report contains a secret: %s", err.Error())
+	}
+}
+
+// stubNetError is a network failure whose Timeout is scripted.
+type stubNetError struct {
+	timeout bool
+}
+
+func (e stubNetError) Error() string   { return "stub network error" }
+func (e stubNetError) Timeout() bool   { return e.timeout }
+func (e stubNetError) Temporary() bool { return e.timeout }
+
+func TestNetworkTimeoutOnlyIsTransient(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{"network timeout is transient", stubNetError{timeout: true}, evs.ErrUnavailable},
+		{
+			"refused or unresolvable network failure is terminal",
+			stubNetError{timeout: false},
+			evs.ErrOperationFailed,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := newStubTransport(scriptedAnswer{err: tc.err})
+			client := newStubClient(t, stubConfig(), transport)
+
+			_, err := client.GetVolume(t.Context(), stubVolumeID)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("expected %v, got: %v", tc.want, err)
+			}
+			if tc.want != evs.ErrUnavailable && errors.Is(err, evs.ErrUnavailable) {
+				t.Fatalf("a terminal network failure was reported as transient: %v", err)
+			}
+		})
 	}
 }

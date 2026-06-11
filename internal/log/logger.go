@@ -23,8 +23,6 @@ var (
 	sensitiveSeparators = []string{
 		": Bearer ",
 		": Basic ",
-		"= ",
-		": ",
 		"=",
 		":",
 	}
@@ -45,11 +43,11 @@ func ParseLevel(levelStr string) slog.Level {
 	}
 }
 
-// IsSensitiveKey returns true if key matches known credential or authorization header names.
+// IsSensitiveKey reports whether key is a known credential or auth header name.
 func IsSensitiveKey(key string) bool {
 	k := strings.ToUpper(strings.TrimSpace(key))
 	switch k {
-	case "OS_ACCESS_KEY", "OS_SECRET_KEY", "OS_SECURITY_TOKEN", "AUTHORIZATION", "AK", "SK":
+	case "AUTHORIZATION", "AK", "SK":
 		return true
 	default:
 		return strings.Contains(k, "SECRET_KEY") ||
@@ -58,7 +56,7 @@ func IsSensitiveKey(key string) bool {
 	}
 }
 
-// RedactAttr sanitizes an individual slog.Attr, masking sensitive key values or inner text.
+// RedactAttr masks sensitive keys and scans string-like values for embedded secrets.
 func RedactAttr(a slog.Attr) slog.Attr {
 	if IsSensitiveKey(a.Key) {
 		return slog.String(a.Key, "***")
@@ -71,6 +69,9 @@ func RedactAttr(a slog.Attr) slog.Attr {
 
 // redactValue recursively redacts supported slog.Value kinds.
 func redactValue(val slog.Value) slog.Value {
+	// Resolve LogValuer values before inspecting kind; otherwise secrets surface later unredacted.
+	val = val.Resolve()
+
 	switch val.Kind() {
 	case slog.KindString:
 		return slog.StringValue(RedactString(val.String()))
@@ -83,14 +84,10 @@ func redactValue(val slog.Value) slog.Value {
 		return slog.GroupValue(redacted...)
 	case slog.KindAny:
 		v := val.Any()
-		if v == nil {
-			return val
-		}
-		if err, ok := v.(error); ok {
-			return slog.StringValue(RedactString(err.Error()))
-		}
-		if str, ok := v.(fmt.Stringer); ok {
-			return slog.StringValue(RedactString(str.String()))
+		switch v.(type) {
+		case error, fmt.Stringer:
+			// Use fmt on error/Stringer so typed nils become "<nil>" instead of panicking.
+			return slog.StringValue(RedactString(fmt.Sprintf("%v", v)))
 		}
 		return val
 	default:
@@ -98,7 +95,7 @@ func redactValue(val slog.Value) slog.Value {
 	}
 }
 
-// RedactString sanitizes sensitive credentials within a string, masking values to "***".
+// RedactString masks credential values embedded in s (e.g. OS_SECRET_KEY=...).
 func RedactString(s string) string {
 	if s == "" {
 		return s
@@ -113,8 +110,8 @@ func RedactString(s string) string {
 	return res
 }
 
-// maskKeyValues scans s for all instances of prefix (e.g., "OS_SECRET_KEY=") and replaces the
-// corresponding value token with "***".
+// maskKeyValues replaces values after each prefix match with "***".
+// Matches that only end a longer word are skipped (see startsName).
 func maskKeyValues(s, prefix string) string {
 	idx := 0
 	for {
@@ -123,7 +120,13 @@ func maskKeyValues(s, prefix string) string {
 			break
 		}
 
-		start := idx + pos + len(prefix)
+		keyStart := idx + pos
+		if !startsName(s, keyStart) {
+			idx = keyStart + 1
+			continue
+		}
+
+		start := keyStart + len(prefix)
 		valStart, valEnd := valueBounds(s, start)
 		if valEnd > valStart {
 			s = s[:valStart] + "***" + s[valEnd:]
@@ -135,7 +138,7 @@ func maskKeyValues(s, prefix string) string {
 	return s
 }
 
-// Spaces and quotes after the prefix are excluded from the value.
+// Skip leading spaces/quotes; value runs until a delimiter.
 func valueBounds(s string, start int) (valStart, valEnd int) {
 	valStart = start
 	for valStart < len(s) && isQuoteOrSpace(s[valStart]) {
@@ -149,6 +152,16 @@ func valueBounds(s string, start int) (valStart, valEnd int) {
 	return valStart, valEnd
 }
 
+// startsName is true when the match at pos is not a suffix of a longer word.
+// Letter/digit before pos continues a word ("DISK:" is not "SK"); "_", "-", "." do not.
+func startsName(s string, pos int) bool {
+	return pos == 0 || !isLetterOrDigit(s[pos-1])
+}
+
+func isLetterOrDigit(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+}
+
 func isQuoteOrSpace(b byte) bool {
 	return b == ' ' || b == '"' || b == '\''
 }
@@ -157,22 +170,19 @@ func isTokenDelimiter(b byte) bool {
 	return b == ' ' || b == '"' || b == '\'' || b == '}' || b == ',' || b == ';' || b == '\n'
 }
 
-// SanitizingHandler wraps an underlying slog.Handler to redact sensitive credentials.
+// SanitizingHandler redacts secrets in slog records before next.
 type SanitizingHandler struct {
 	next slog.Handler
 }
 
-// NewSanitizingHandler adds credential redaction to next.
 func NewSanitizingHandler(next slog.Handler) slog.Handler {
 	return &SanitizingHandler{next: next}
 }
 
-// Enabled reports whether next accepts records at level.
 func (h *SanitizingHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return h.next.Enabled(ctx, level)
 }
 
-// Handle redacts sensitive credentials from record message and attributes before delegating.
 func (h *SanitizingHandler) Handle(ctx context.Context, r slog.Record) error {
 	newMsg := RedactString(r.Message)
 	newRecord := slog.NewRecord(r.Time, r.Level, newMsg, r.PC)
@@ -185,7 +195,6 @@ func (h *SanitizingHandler) Handle(ctx context.Context, r slog.Record) error {
 	return h.next.Handle(ctx, newRecord)
 }
 
-// WithAttrs returns a new handler with the given attributes redacted.
 func (h *SanitizingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	redacted := make([]slog.Attr, len(attrs))
 	for i, a := range attrs {
@@ -194,13 +203,11 @@ func (h *SanitizingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &SanitizingHandler{next: h.next.WithAttrs(redacted)}
 }
 
-// WithGroup preserves redaction within the named group.
 func (h *SanitizingHandler) WithGroup(name string) slog.Handler {
 	return &SanitizingHandler{next: h.next.WithGroup(name)}
 }
 
-// NewLogger creates a new credential-sanitizing *slog.Logger using the provided writer and level.
-// If w is nil, os.Stdout is used.
+// NewLogger returns a JSON slog.Logger that redacts credentials. nil w means os.Stdout.
 func NewLogger(w io.Writer, level slog.Level) *slog.Logger {
 	if w == nil {
 		w = os.Stdout
@@ -212,8 +219,7 @@ func NewLogger(w io.Writer, level slog.Level) *slog.Logger {
 	return slog.New(NewSanitizingHandler(baseHandler))
 }
 
-// NewLoggerFromEnv creates a new *slog.Logger reading the LOG_LEVEL environment variable.
-// If w is nil, os.Stdout is used.
+// NewLoggerFromEnv is NewLogger with level from LOG_LEVEL (default info).
 func NewLoggerFromEnv(w io.Writer) *slog.Logger {
 	levelStr := os.Getenv("LOG_LEVEL")
 	level := ParseLevel(levelStr)
