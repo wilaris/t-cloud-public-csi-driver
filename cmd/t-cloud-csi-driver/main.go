@@ -22,6 +22,7 @@ import (
 	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 	"wilaris.dev/t-cloud-public-csi-driver/internal/log"
 	"wilaris.dev/t-cloud-public-csi-driver/internal/mount"
+	"wilaris.dev/t-cloud-public-csi-driver/internal/version"
 )
 
 // socketDirPerm is the permission mode for a created endpoint socket directory.
@@ -30,9 +31,20 @@ const socketDirPerm = 0o750
 func main() {
 	logger := log.NewLoggerFromEnv(os.Stdout)
 
+	// Recorded before configuration so a failed start still names the build that failed.
+	info := version.Get()
+	logger.Info(
+		"Starting CSI driver",
+		slog.String("version", info.Version),
+		slog.String("commit", info.Commit),
+		slog.String("build_date", info.BuildDate),
+		slog.String("go", info.GoVersion),
+		slog.String("platform", info.Platform),
+	)
+
 	err := run(logger)
-	// A help request already printed usage; it is not a startup failure.
-	if errors.Is(err, flag.ErrHelp) {
+	// Help and version requests already printed their output; neither is a startup failure.
+	if errors.Is(err, flag.ErrHelp) || errors.Is(err, config.ErrVersionRequested) {
 		return
 	}
 	if err != nil {

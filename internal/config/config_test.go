@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
+	"wilaris.dev/t-cloud-public-csi-driver/internal/version"
 )
 
 func validEnvMap() map[string]string {
@@ -39,7 +40,6 @@ func TestParseSuccess(t *testing.T) {
 		"--nodeid", "68e1a123-4567-89ab-cdef-0123456789ab",
 		"--endpoint", "unix:///tmp/csi.sock",
 		"--driver-name", "my-custom-driver",
-		"--version", "v1.2.3",
 		"--availability-zone", "eu-de-01",
 	}
 
@@ -60,8 +60,8 @@ func TestParseSuccess(t *testing.T) {
 	if cfg.DriverName != "my-custom-driver" {
 		t.Errorf("expected DriverName %q, got %q", "my-custom-driver", cfg.DriverName)
 	}
-	if cfg.Version != "v1.2.3" {
-		t.Errorf("expected Version %q, got %q", "v1.2.3", cfg.Version)
+	if cfg.Version != config.DriverVersion {
+		t.Errorf("expected Version %q, got %q", config.DriverVersion, cfg.Version)
 	}
 	if cfg.AuthURL != env[config.EnvAuthURL] {
 		t.Errorf("expected AuthURL %q, got %q", env[config.EnvAuthURL], cfg.AuthURL)
@@ -112,8 +112,8 @@ func TestParseDefaultFlags(t *testing.T) {
 	if cfg.DriverName != config.DefaultDriverName {
 		t.Errorf("expected default DriverName %q, got %q", config.DefaultDriverName, cfg.DriverName)
 	}
-	if cfg.Version != config.DefaultVersion {
-		t.Errorf("expected default Version %q, got %q", config.DefaultVersion, cfg.Version)
+	if cfg.Version != config.DriverVersion {
+		t.Errorf("expected stamped Version %q, got %q", config.DriverVersion, cfg.Version)
 	}
 }
 
@@ -423,6 +423,32 @@ func captureStderr(t *testing.T, fn func()) string {
 	return string(out)
 }
 
+// captureStdout swaps process stdout for a pipe and returns what is written after fn runs.
+// Not safe for parallel use; callers must not mark their tests parallel.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create stdout pipe: %v", err)
+	}
+
+	original := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = original }()
+
+	fn()
+
+	_ = w.Close()
+	os.Stdout = original
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read captured stdout: %v", err)
+	}
+	return string(out)
+}
+
 func TestFlagParseFailureReportsOnlyThroughTheError(t *testing.T) {
 	// Not parallel: captures process stderr.
 	var parseErr error
@@ -459,5 +485,45 @@ func TestFlagHelpRequestPrintsUsage(t *testing.T) {
 	}
 	if !strings.Contains(out, "Usage") {
 		t.Errorf("expected a help request to print usage, got: %q", out)
+	}
+}
+
+func TestVersionFlagPrintsBuildIdentityAndStops(t *testing.T) {
+	// Not parallel: captures process stdout.
+	var (
+		cfg      *config.Config
+		parseErr error
+	)
+	out := captureStdout(t, func() {
+		cfg, parseErr = config.Parse([]string{"--version"}, mockGetenv(validEnvMap()))
+	})
+
+	if !errors.Is(parseErr, config.ErrVersionRequested) {
+		t.Fatalf("expected a version request to surface ErrVersionRequested, got: %v", parseErr)
+	}
+	if cfg != nil {
+		t.Errorf("expected no configuration from a version request, got: %v", cfg)
+	}
+	if !strings.Contains(out, "t-cloud-csi-driver") {
+		t.Errorf("expected the version output to name the command, got: %q", out)
+	}
+	if !strings.Contains(out, version.Version()) {
+		t.Errorf("expected the version output to report %q, got: %q", version.Version(), out)
+	}
+	if strings.Count(out, "\n") != 1 {
+		t.Errorf("expected exactly one line of version output, got: %q", out)
+	}
+}
+
+// The version request is handled before the role check, so it needs no other input.
+func TestVersionFlagNeedsNoRole(t *testing.T) {
+	// Not parallel: captures process stdout.
+	var parseErr error
+	_ = captureStdout(t, func() {
+		_, parseErr = config.Parse([]string{"--version"}, mockGetenv(map[string]string{}))
+	})
+
+	if !errors.Is(parseErr, config.ErrVersionRequested) {
+		t.Fatalf("expected a version request without a role to be answered, got: %v", parseErr)
 	}
 }

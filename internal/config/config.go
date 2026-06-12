@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"wilaris.dev/t-cloud-public-csi-driver/internal/version"
 )
 
 const (
@@ -20,8 +22,6 @@ const (
 	// must match DefaultDriverName, because kubelet derives the plugin socket directory from
 	// the name the driver registers under.
 	DefaultEndpoint = "unix:///var/lib/kubelet/plugins/evs.csi.t-cloud.wilaris.dev/csi.sock"
-	// DefaultVersion is the default driver release version.
-	DefaultVersion = "v0.1.0"
 
 	EnvAuthURL       = "OS_AUTH_URL"
 	EnvAccessKey     = "OS_ACCESS_KEY"
@@ -30,6 +30,13 @@ const (
 	EnvRegionName    = "OS_REGION_NAME"
 	EnvSecurityToken = "OS_SECURITY_TOKEN" //nolint:gosec // environment variable name constant
 )
+
+// DriverVersion is the release version reported through the CSI Identity service. The linker stamps
+// it into the binary at build time; see the Makefile.
+var DriverVersion = version.Version()
+
+// ErrVersionRequested reports that --version was handled and the process should exit cleanly.
+var ErrVersionRequested = errors.New("version requested")
 
 // Role selects which CSI services a process registers and which inputs it requires.
 type Role string
@@ -66,7 +73,8 @@ type Config struct {
 	Endpoint   string
 	NodeID     string
 	DriverName string
-	Version    string
+	// Version is the stamped build identity carried here for the Identity service to report.
+	Version string
 	// AvailabilityZone is the EVS availability zone of this node. It is required by the
 	// Node service, which reports it as the node's zone topology, and unused by the
 	// Controller service, which takes the zone from each request instead.
@@ -137,7 +145,7 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 		endpoint         string
 		nodeID           string
 		driverName       string
-		version          string
+		showVersion      bool
 		availabilityZone string
 	)
 
@@ -160,7 +168,7 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 		"T Cloud Public compute instance Server UUID; overrides the metadata value on the node role",
 	)
 	fs.StringVar(&driverName, "driver-name", DefaultDriverName, "CSI driver name")
-	fs.StringVar(&version, "version", DefaultVersion, "CSI driver version")
+	fs.BoolVar(&showVersion, "version", false, "print the build identity and exit")
 	fs.StringVar(
 		&availabilityZone,
 		"availability-zone",
@@ -175,6 +183,12 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse CLI flags: %w", err)
 	}
 
+	// Handled before the role check so the build identity is reachable without operator input.
+	if showVersion {
+		_, _ = fmt.Fprintf(os.Stdout, "%s %s\n", fs.Name(), version.Get())
+		return nil, ErrVersionRequested
+	}
+
 	parsedRole, err := parseRole(strings.TrimSpace(role))
 	if err != nil {
 		return nil, err
@@ -185,7 +199,7 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 		Endpoint:         strings.TrimSpace(endpoint),
 		NodeID:           strings.TrimSpace(nodeID),
 		DriverName:       strings.TrimSpace(driverName),
-		Version:          strings.TrimSpace(version),
+		Version:          DriverVersion,
 		AvailabilityZone: strings.TrimSpace(availabilityZone),
 	}
 

@@ -97,7 +97,7 @@ func nodeTestConfig() *config.Config {
 		NodeID:           "12345678-1234-1234-1234-123456789012",
 		AvailabilityZone: "eu-de-01",
 		DriverName:       config.DefaultDriverName,
-		Version:          config.DefaultVersion,
+		Version:          config.DriverVersion,
 	}
 }
 
