@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"path/filepath"
 	"slices"
@@ -31,8 +32,7 @@ const (
 	coReservedParameterPrefix = "csi.storage.k8s.io/"
 	// minVolumeSizeGiB is the EVS minimum; smaller or omitted capacity becomes this size.
 	minVolumeSizeGiB = 10
-	// bytesInGiB is the number of bytes in one GiB.
-	bytesInGiB = 1024 * 1024 * 1024
+	bytesInGiB       = 1024 * 1024 * 1024
 	// devDirPrefix is the host device directory a published device path must name. The controller
 	// only checks path shape; node resolves the device.
 	devDirPrefix = "/dev/"
@@ -54,23 +54,30 @@ type ControllerService struct {
 
 	evsClient EVSClient
 	cfg       *config.Config
+	logger    *slog.Logger
 }
 
-// NewControllerService constructs a new ControllerService instance.
-func NewControllerService(evsClient EVSClient, cfg *config.Config) (*ControllerService, error) {
+func NewControllerService(
+	evsClient EVSClient,
+	cfg *config.Config,
+	logger *slog.Logger,
+) (*ControllerService, error) {
 	if evsClient == nil {
 		return nil, fmt.Errorf("EVS client cannot be nil")
 	}
 	if cfg == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
+	if logger == nil {
+		return nil, fmt.Errorf("logger cannot be nil")
+	}
 	return &ControllerService{
 		evsClient: evsClient,
 		cfg:       cfg,
+		logger:    logger,
 	}, nil
 }
 
-// ControllerGetCapabilities returns the capabilities supported by the Controller service.
 func (s *ControllerService) ControllerGetCapabilities(
 	ctx context.Context,
 	req *csi.ControllerGetCapabilitiesRequest,
@@ -240,6 +247,12 @@ func (s *ControllerService) CreateVolume(
 		MaxSizeGiB:       limitSizeGiB(req.GetCapacityRange()),
 	})
 	if err == nil {
+		s.logger.InfoContext(
+			ctx,
+			"Adopted an existing volume",
+			slog.String("volume_id", existing.ID),
+			slog.Int("size_gib", sizeGiB),
+		)
 		return formatCreateVolumeResponse(existing), nil
 	}
 	if !errors.Is(err, evs.ErrNotFound) {
@@ -255,6 +268,15 @@ func (s *ControllerService) CreateVolume(
 	if err != nil {
 		return nil, toGRPCError("create volume", codes.AlreadyExists, err)
 	}
+
+	s.logger.InfoContext(
+		ctx,
+		"Created a volume",
+		slog.String("volume_id", created.ID),
+		slog.Int("size_gib", sizeGiB),
+		slog.String("volume_type", volType),
+		slog.String("availability_zone", zone),
+	)
 
 	return formatCreateVolumeResponse(created), nil
 }
@@ -274,6 +296,11 @@ func (s *ControllerService) DeleteVolume(
 	err := s.evsClient.DeleteVolume(ctx, req.GetVolumeId())
 	if err != nil {
 		if errors.Is(err, evs.ErrNotFound) {
+			s.logger.InfoContext(
+				ctx,
+				"Volume was already absent",
+				slog.String("volume_id", req.GetVolumeId()),
+			)
 			return &csi.DeleteVolumeResponse{}, nil
 		}
 		// Map missing ownership to FailedPrecondition (not Internal).
@@ -292,6 +319,7 @@ func (s *ControllerService) DeleteVolume(
 			err,
 		)
 	}
+	s.logger.InfoContext(ctx, "Deleted a volume", slog.String("volume_id", req.GetVolumeId()))
 
 	return &csi.DeleteVolumeResponse{}, nil
 }
@@ -483,7 +511,7 @@ func pickAvailabilityZone(topReq *csi.TopologyRequirement, params map[string]str
 	return ""
 }
 
-// formatCreateVolumeResponse converts an evs.Volume into a csi.CreateVolumeResponse.
+// formatCreateVolumeResponse builds the CSI create response.
 // Volume context stays empty; the attach handoff uses the publish context.
 func formatCreateVolumeResponse(vol *evs.Volume) *csi.CreateVolumeResponse {
 	return &csi.CreateVolumeResponse{

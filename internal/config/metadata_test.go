@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -172,6 +173,40 @@ func TestMetadataFetchRetriesUntilTheServiceAnswers(t *testing.T) {
 	}
 }
 
+func TestMetadataFetchRetriesATransportFailure(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) > 1 {
+			_, _ = w.Write([]byte(metadataBody(testServerUUID, testAvailabilityZone)))
+			return
+		}
+		// Drop the connection without answering
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("expected the stub to hijack its connection, got: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(server.Close)
+
+	client := newMetadataClient()
+	client.baseURL = server.URL
+
+	facts, err := client.fetch(t.Context())
+	if err != nil {
+		t.Fatalf("expected retrieval to survive a transport failure, got: %v", err)
+	}
+	if facts.serverUUID != testServerUUID {
+		t.Errorf("expected server UUID %q, got %q", testServerUUID, facts.serverUUID)
+	}
+	if observed := requests.Load(); observed != 2 {
+		t.Errorf("expected the failed connection to be retried once, saw %d attempts", observed)
+	}
+}
+
 func TestMetadataFetchDoesNotRetryATerminalAnswer(t *testing.T) {
 	t.Parallel()
 
@@ -213,7 +248,8 @@ func TestMetadataFetchStopsRetryingWhenTheCallerIsDone(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	if _, err := client.fetch(ctx); err == nil {
+	_, err := client.fetch(ctx)
+	if err == nil {
 		t.Fatal("expected a canceled retrieval to fail")
 	}
 	if waited := time.Since(start); waited >= metadataTimeout {
@@ -221,6 +257,38 @@ func TestMetadataFetchStopsRetryingWhenTheCallerIsDone(t *testing.T) {
 	}
 	if observed := requests.Load(); observed != 1 {
 		t.Errorf("expected retrying to stop after the first attempt, saw %d", observed)
+	}
+	// The wait itself is what the caller interrupts, so the failure keeps the answer that prompted
+	// the retry alongside the cause. Abandoning only at the next attempt would report that
+	// attempt's transport failure instead, and lose the status.
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected the caller's cause to be reported, got: %v", err)
+	}
+	prompting := fmt.Sprintf("status %d", http.StatusServiceUnavailable)
+	if !strings.Contains(err.Error(), prompting) {
+		t.Errorf("expected the answer that prompted the retry to be kept, got: %v", err)
+	}
+}
+
+func TestMetadataFetchStopsAtItsOwnDeadline(t *testing.T) {
+	t.Parallel()
+
+	client, requests := newMetadataServer(t, http.StatusServiceUnavailable, `{}`)
+
+	start := time.Now()
+	if _, err := client.fetch(context.WithoutCancel(t.Context())); err == nil {
+		t.Fatal("expected a service that never answers to fail retrieval")
+	}
+
+	waited := time.Since(start)
+	if waited < metadataTimeout {
+		t.Errorf("retrieval gave up after %s, before its own deadline", waited)
+	}
+	if waited > 2*metadataTimeout {
+		t.Errorf("retrieval ran for %s, well past its own deadline", waited)
+	}
+	if observed := requests.Load(); observed < 2 {
+		t.Errorf("expected repeated attempts within the deadline, saw %d", observed)
 	}
 }
 
@@ -289,6 +357,24 @@ func TestResolveNodeFactsMergesExplicitInputsWithMetadata(t *testing.T) {
 				t.Errorf("expected %d metadata requests, saw %d", tc.wantRequests, requests.Load())
 			}
 		})
+	}
+}
+
+func TestResolveNodeFactsFetchFailureLeavesNoPartialIdentity(t *testing.T) {
+	t.Parallel()
+
+	client, _ := newMetadataServer(t, http.StatusNotFound, `{}`)
+	cfg := &Config{Role: RoleNode}
+
+	if err := cfg.resolveNodeFacts(t.Context(), client); err == nil {
+		t.Fatal("expected a failed retrieval to fail resolution")
+	}
+	if cfg.NodeID != "" || cfg.AvailabilityZone != "" {
+		t.Errorf(
+			"a failed retrieval left a partial identity: %q, %q",
+			cfg.NodeID,
+			cfg.AvailabilityZone,
+		)
 	}
 }
 

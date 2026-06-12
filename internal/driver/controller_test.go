@@ -167,7 +167,7 @@ func TestNewControllerService(t *testing.T) {
 	client := newMockEVSClient()
 	cfg := validTestConfig()
 
-	svc, err := driver.NewControllerService(client, cfg)
+	svc, err := driver.NewControllerService(client, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -175,21 +175,26 @@ func TestNewControllerService(t *testing.T) {
 		t.Fatal("expected non-nil service")
 	}
 
-	_, err = driver.NewControllerService(nil, cfg)
+	_, err = driver.NewControllerService(nil, cfg, discardLogger())
 	if err == nil {
 		t.Error("expected error for nil client")
 	}
 
-	_, err = driver.NewControllerService(client, nil)
+	_, err = driver.NewControllerService(client, nil, discardLogger())
 	if err == nil {
 		t.Error("expected error for nil config")
+	}
+
+	_, err = driver.NewControllerService(client, cfg, nil)
+	if err == nil {
+		t.Error("expected error for nil logger")
 	}
 }
 
 func TestControllerGetCapabilities(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig())
+	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
 	resp, err := svc.ControllerGetCapabilities(
 		t.Context(),
 		&csi.ControllerGetCapabilitiesRequest{},
@@ -215,7 +220,7 @@ func TestControllerPublishVolume_HappyPath(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(client, validTestConfig())
+	svc, _ := driver.NewControllerService(client, validTestConfig(), discardLogger())
 
 	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
 		Name:             "pub-vol",
@@ -273,7 +278,11 @@ func TestControllerPublishVolume_UnusableDevicePath(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(&bareDeviceEVSClient{client}, validTestConfig())
+	svc, _ := driver.NewControllerService(
+		&bareDeviceEVSClient{client},
+		validTestConfig(),
+		discardLogger(),
+	)
 
 	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
 		Name:             "bare-device-vol",
@@ -296,7 +305,7 @@ func TestControllerPublishVolume_Idempotency(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(client, validTestConfig())
+	svc, _ := driver.NewControllerService(client, validTestConfig(), discardLogger())
 
 	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
 		Name:             "idempotent-pub-vol",
@@ -341,7 +350,7 @@ func TestControllerPublishVolume_Idempotency(t *testing.T) {
 func TestControllerPublishVolume_ValidationFailures(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig())
+	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
 
 	// Nil request
 	_, err := svc.ControllerPublishVolume(t.Context(), nil)
@@ -393,7 +402,7 @@ func TestControllerUnpublishVolume_HappyPath(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(client, validTestConfig())
+	svc, _ := driver.NewControllerService(client, validTestConfig(), discardLogger())
 
 	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
 		Name:             "unpub-vol",
@@ -427,7 +436,7 @@ func TestControllerUnpublishVolume_HappyPath(t *testing.T) {
 func TestControllerUnpublishVolume_ValidationFailures(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig())
+	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
 
 	// Nil request
 	_, err := svc.ControllerUnpublishVolume(t.Context(), nil)
@@ -461,7 +470,7 @@ func TestControllerUnpublishVolume_ValidationFailures(t *testing.T) {
 func TestCreateVolume_HappyPath(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig())
+	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
 	req := &csi.CreateVolumeRequest{
 		Name: "test-volume",
 		CapacityRange: &csi.CapacityRange{
@@ -505,16 +514,16 @@ func TestCreateVolume_TopologyRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	cfg := validTestConfig()
-	identityService, err := driver.NewIdentityService(cfg)
+	identityService, err := driver.NewIdentityService(cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewIdentityService failed: %v", err)
 	}
-	nodeService, err := driver.NewNodeService(&fakeMounter{}, cfg)
+	nodeService, err := driver.NewNodeService(&fakeMounter{}, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
 	evsClient := newMockEVSClient()
-	controllerService, err := driver.NewControllerService(evsClient, cfg)
+	controllerService, err := driver.NewControllerService(evsClient, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
@@ -612,7 +621,7 @@ func TestCreateVolume_TopologyRoundTrip(t *testing.T) {
 func TestCreateVolume_Idempotency(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig())
+	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
 	req := &csi.CreateVolumeRequest{
 		Name: "idempotent-vol",
 		CapacityRange: &csi.CapacityRange{
@@ -735,7 +744,7 @@ func TestCreateVolume_IdempotencyRejectsIncompatibleVolume(t *testing.T) {
 				t.Fatalf("create existing volume: %v", err)
 			}
 
-			svc, err := driver.NewControllerService(client, validTestConfig())
+			svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
 			if err != nil {
 				t.Fatalf("NewControllerService failed: %v", err)
 			}
@@ -768,7 +777,7 @@ func TestCreateVolume_IdempotencyRejectsIncompatibleVolume(t *testing.T) {
 func TestCreateVolume_UnsupportedAccessMode(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig())
+	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
 	req := &csi.CreateVolumeRequest{
 		Name: "multi-node-vol",
 		VolumeCapabilities: []*csi.VolumeCapability{
@@ -790,7 +799,7 @@ func TestCreateVolume_UnsupportedAccessMode(t *testing.T) {
 func TestCreateVolume_ValidationFailures(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig())
+	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
 
 	// Nil request
 	_, err := svc.CreateVolume(t.Context(), nil)
@@ -850,7 +859,7 @@ func TestDeleteVolume(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(client, validTestConfig())
+	svc, _ := driver.NewControllerService(client, validTestConfig(), discardLogger())
 
 	// Create a volume directly in mock
 	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
@@ -887,7 +896,7 @@ func TestValidateVolumeCapabilities(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(client, validTestConfig())
+	svc, _ := driver.NewControllerService(client, validTestConfig(), discardLogger())
 
 	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
 		Name:             "val-vol",
@@ -955,8 +964,7 @@ func requisiteZone(zone string) *csi.TopologyRequirement {
 	}
 }
 
-// TestCreateVolume_AcceptsOnlyTheDeclaredParameters fixes the accepted StorageClass parameter set.
-// CO-reserved keys are ignored; other unknown keys are rejected before EVS calls.
+// Accepts type and availability_zone; ignores csi.storage.k8s.io/*; rejects other keys.
 func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 	t.Parallel()
 
@@ -1051,7 +1059,7 @@ func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 			t.Parallel()
 
 			client := newMockEVSClient()
-			svc, err := driver.NewControllerService(client, validTestConfig())
+			svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
 			if err != nil {
 				t.Fatalf("NewControllerService failed: %v", err)
 			}
@@ -1095,7 +1103,7 @@ func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 	}
 }
 
-// TestCreateVolume_RejectsAVolumeContentSource: CreateVolume rejects VolumeContentSource (not advertised).
+// CreateVolume must reject any VolumeContentSource.
 func TestCreateVolume_RejectsAVolumeContentSource(t *testing.T) {
 	t.Parallel()
 
@@ -1130,7 +1138,7 @@ func TestCreateVolume_RejectsAVolumeContentSource(t *testing.T) {
 			t.Parallel()
 
 			client := newMockEVSClient()
-			svc, err := driver.NewControllerService(client, validTestConfig())
+			svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
 			if err != nil {
 				t.Fatalf("NewControllerService failed: %v", err)
 			}
@@ -1156,7 +1164,7 @@ func TestCreateVolume_RejectsAVolumeContentSource(t *testing.T) {
 	}
 }
 
-// TestCreateVolume_ResolvesRequestedCapacity: min 10GiB, round up partial GiB, no artificial max.
+// Capacity: floor 10GiB, round up partial GiB, no artificial max.
 func TestCreateVolume_ResolvesRequestedCapacity(t *testing.T) {
 	t.Parallel()
 
@@ -1228,7 +1236,7 @@ func TestCreateVolume_ResolvesRequestedCapacity(t *testing.T) {
 			t.Parallel()
 
 			client := newMockEVSClient()
-			svc, err := driver.NewControllerService(client, validTestConfig())
+			svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
 			if err != nil {
 				t.Fatalf("NewControllerService failed: %v", err)
 			}
@@ -1262,8 +1270,7 @@ func TestCreateVolume_ResolvesRequestedCapacity(t *testing.T) {
 	}
 }
 
-// TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity:
-// InvalidArgument for bad ranges; OutOfRange when no size fits the limit.
+// Bad ranges -> InvalidArgument; no size in range -> OutOfRange.
 func TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity(t *testing.T) {
 	t.Parallel()
 
@@ -1320,7 +1327,7 @@ func TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity(t *testing
 			t.Parallel()
 
 			client := newMockEVSClient()
-			svc, err := driver.NewControllerService(client, validTestConfig())
+			svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
 			if err != nil {
 				t.Fatalf("NewControllerService failed: %v", err)
 			}
@@ -1347,12 +1354,12 @@ func TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity(t *testing
 	}
 }
 
-// TestCreateVolume_ReflectsNoParameterIntoTheResponse: empty volume context and no content source.
+// Response volume context empty; no content source echoed.
 func TestCreateVolume_ReflectsNoParameterIntoTheResponse(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, err := driver.NewControllerService(client, validTestConfig())
+	svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
 	if err != nil {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
@@ -1382,7 +1389,7 @@ func TestControllerService_GRPC_WireTransport(t *testing.T) {
 	t.Parallel()
 
 	evsMock := newMockEVSClient()
-	svc, err := driver.NewControllerService(evsMock, validTestConfig())
+	svc, err := driver.NewControllerService(evsMock, validTestConfig(), discardLogger())
 	if err != nil {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
@@ -1514,7 +1521,7 @@ func TestControllerService_UnixDomainSocket_WireTransport(t *testing.T) {
 	}
 
 	evsMock := newMockEVSClient()
-	svc, err := driver.NewControllerService(evsMock, validTestConfig())
+	svc, err := driver.NewControllerService(evsMock, validTestConfig(), discardLogger())
 	if err != nil {
 		_ = ln.Close()
 		t.Fatalf("NewControllerService failed: %v", err)

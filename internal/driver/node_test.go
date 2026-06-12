@@ -145,7 +145,7 @@ func TestNewNodeService_Validation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			svc, err := driver.NewNodeService(tt.mounter, tt.cfg)
+			svc, err := driver.NewNodeService(tt.mounter, tt.cfg, discardLogger())
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("NewNodeService() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -161,7 +161,7 @@ func TestNodeService_NodeGetInfo(t *testing.T) {
 
 	cfg := validTestConfig()
 	fm := &fakeMounter{}
-	svc, err := driver.NewNodeService(fm, cfg)
+	svc, err := driver.NewNodeService(fm, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestNodeService_NodeGetCapabilities(t *testing.T) {
 
 	cfg := validTestConfig()
 	fm := &fakeMounter{}
-	svc, err := driver.NewNodeService(fm, cfg)
+	svc, err := driver.NewNodeService(fm, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestNodeService_NodeStageVolume(t *testing.T) {
 		},
 	}
 
-	svc, err := driver.NewNodeService(fm, cfg)
+	svc, err := driver.NewNodeService(fm, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestNodeService_NodeUnstageVolume(t *testing.T) {
 		},
 	}
 
-	svc, err := driver.NewNodeService(fm, cfg)
+	svc, err := driver.NewNodeService(fm, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
@@ -387,7 +387,7 @@ func TestNodeService_NodePublishVolume(t *testing.T) {
 		},
 	}
 
-	svc, err := driver.NewNodeService(fm, cfg)
+	svc, err := driver.NewNodeService(fm, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
@@ -533,7 +533,7 @@ func TestNodeService_NodeUnpublishVolume(t *testing.T) {
 		},
 	}
 
-	svc, err := driver.NewNodeService(fm, cfg)
+	svc, err := driver.NewNodeService(fm, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
@@ -580,7 +580,7 @@ func TestNodeService_ErrorHandling(t *testing.T) {
 		},
 	}
 
-	svc, err := driver.NewNodeService(fm, cfg)
+	svc, err := driver.NewNodeService(fm, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
@@ -668,7 +668,7 @@ func TestNodeService_DeviceDiscoveryFromPublishContext(t *testing.T) {
 				},
 			}
 
-			svc, err := driver.NewNodeService(fm, cfg)
+			svc, err := driver.NewNodeService(fm, cfg, discardLogger())
 			if err != nil {
 				t.Fatalf("NewNodeService failed: %v", err)
 			}
@@ -717,7 +717,7 @@ func TestNodeService_DeviceIdentityMismatch(t *testing.T) {
 		},
 	}
 
-	svc, err := driver.NewNodeService(fm, validTestConfig())
+	svc, err := driver.NewNodeService(fm, validTestConfig(), discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}

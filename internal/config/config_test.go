@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -133,6 +134,48 @@ func TestUnacceptedAuthMethodsAndAliasesNotSupported(t *testing.T) {
 	}
 }
 
+func TestParseNodeRoleReadsNoCredentialVariable(t *testing.T) {
+	t.Parallel()
+
+	env := validEnvMap()
+	var reads []string
+	spy := func(key string) string {
+		reads = append(reads, key)
+		return env[key]
+	}
+
+	cfg, err := config.Parse([]string{
+		"--role", "node",
+		"--nodeid", "node-uuid-123",
+		"--availability-zone", "eu-de-01",
+	}, spy)
+	if err != nil {
+		t.Fatalf("expected the node role to parse without credentials, got: %v", err)
+	}
+
+	if cfg.AuthURL != "" || cfg.ProjectID != "" || cfg.RegionName != "" {
+		t.Errorf("node configuration carries cloud settings: %s", cfg)
+	}
+	if cfg.AccessKey.Value() != "" || cfg.SecretKey.Value() != "" ||
+		cfg.SecurityToken.Value() != "" {
+		t.Error("node configuration carries a credential value")
+	}
+
+	credentialKeys := []string{
+		config.EnvAuthURL,
+		config.EnvAccessKey,
+		config.EnvSecretKey,
+		config.EnvProjectID,
+		config.EnvRegionName,
+		config.EnvSecurityToken,
+	}
+	for _, read := range reads {
+		if slices.Contains(credentialKeys, read) {
+			t.Errorf("node role read environment variable %s", read)
+		}
+	}
+}
+
 func TestInvalidEndpoint(t *testing.T) {
 	t.Parallel()
 
@@ -149,7 +192,10 @@ func TestInvalidEndpoint(t *testing.T) {
 		{"tcp endpoint with path", "tcp://127.0.0.1:9000/csi"},
 		{"unix endpoint with query", "unix:///run/csi.sock?mode=0600"},
 		{"unix endpoint with fragment", "unix:///run/csi.sock#main"},
+		{"unix endpoint with user information", "unix://user@/run/csi.sock"},
 		{"tcp endpoint with user information", "tcp://user@127.0.0.1:9000"},
+		{"tcp endpoint with query", "tcp://127.0.0.1:9000?tls=on"},
+		{"tcp endpoint with fragment", "tcp://127.0.0.1:9000#main"},
 	}
 
 	for _, tc := range testCases {
@@ -187,6 +233,12 @@ func TestNetworkResolvesWhatTheListenerBinds(t *testing.T) {
 			"unix:///var/lib/kubelet/plugins/csi.sock",
 			"unix",
 			"/var/lib/kubelet/plugins/csi.sock",
+		},
+		{
+			"default endpoint",
+			config.DefaultEndpoint,
+			"unix",
+			"/var/lib/kubelet/plugins/evs.csi.t-cloud.wilaris.dev/csi.sock",
 		},
 		{"tcp endpoint", "tcp://127.0.0.1:9000", "tcp", "127.0.0.1:9000"},
 		{"tcp endpoint on all interfaces", "tcp://0.0.0.0:9000", "tcp", "0.0.0.0:9000"},

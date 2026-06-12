@@ -130,9 +130,7 @@ func capabilityRPCs() []capabilityRPC {
 	}
 }
 
-// capabilityProbeResult reports what one RPC attempt observed: the RPC error, whether
-// ValidateVolumeCapabilities confirmed, the host operations the attempt reached, and the cloud
-// mutations it left behind.
+// capabilityProbeResult is the outcome of one capability-validating RPC probe.
 type capabilityProbeResult struct {
 	err       error
 	confirmed bool
@@ -164,13 +162,13 @@ func probeCapability(
 		t.Fatalf("failed to seed probe volume: %v", err)
 	}
 
-	controller, err := driver.NewControllerService(evsClient, cfg)
+	controller, err := driver.NewControllerService(evsClient, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
 
 	mounter := &recordingMounter{}
-	node, err := driver.NewNodeService(mounter, cfg)
+	node, err := driver.NewNodeService(mounter, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
@@ -573,7 +571,7 @@ func TestControllerConflictCarriesTheStatusOfItsOperation(t *testing.T) {
 	cfg := validTestConfig()
 	ctx := t.Context()
 
-	svc, err := driver.NewControllerService(conflictEVSClient{}, cfg)
+	svc, err := driver.NewControllerService(conflictEVSClient{}, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
@@ -663,7 +661,7 @@ func TestControllerConflictCarriesTheStatusOfItsOperation(t *testing.T) {
 		})
 	}
 
-	// The mapping is per-operation: one conflict must surface as several distinct codes.
+	// Distinct ops must map the same EVS conflict to different gRPC codes.
 	if len(observed) < 3 {
 		t.Errorf(
 			"expected one cloud conflict to carry several operation statuses, got %v",
@@ -672,7 +670,7 @@ func TestControllerConflictCarriesTheStatusOfItsOperation(t *testing.T) {
 	}
 
 	// A conflict from CreateVolume itself (not discovery) must map the same way.
-	createSvc, err := driver.NewControllerService(createConflictEVSClient{}, cfg)
+	createSvc, err := driver.NewControllerService(createConflictEVSClient{}, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
@@ -700,7 +698,7 @@ func TestDeleteVolume_RejectsAVolumeWithoutTheOwnershipMarker(t *testing.T) {
 		VolumeType:       "SSD",
 	}
 
-	svc, err := driver.NewControllerService(client, validTestConfig())
+	svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
 	if err != nil {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
@@ -718,7 +716,7 @@ func TestValidateVolumeCapabilities_EchoesEveryConfirmedField(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, err := driver.NewControllerService(client, validTestConfig())
+	svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
 	if err != nil {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
@@ -792,7 +790,7 @@ func TestValidateVolumeCapabilities_UnconfirmedWithoutError(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, err := driver.NewControllerService(client, validTestConfig())
+	svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
 	if err != nil {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
@@ -853,7 +851,6 @@ func TestValidateVolumeCapabilities_UnconfirmedWithoutError(t *testing.T) {
 					Parameters:    tt.parameters,
 				},
 			)
-			// Unsupported fields return Confirmed=nil without a gRPC error.
 			if err != nil {
 				t.Fatalf("expected Confirmed=nil, got error: %v", err)
 			}
@@ -873,7 +870,7 @@ func TestNodeCapabilitySetCoversEveryAcceptedAccessMode(t *testing.T) {
 	t.Parallel()
 
 	mounter := &recordingMounter{}
-	svc, err := driver.NewNodeService(mounter, validTestConfig())
+	svc, err := driver.NewNodeService(mounter, validTestConfig(), discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}

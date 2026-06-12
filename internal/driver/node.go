@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,15 +35,22 @@ type NodeService struct {
 
 	mounter mount.Mounter
 	cfg     *config.Config
+	logger  *slog.Logger
 }
 
-// NewNodeService constructs a new NodeService instance.
-func NewNodeService(mounter mount.Mounter, cfg *config.Config) (*NodeService, error) {
+func NewNodeService(
+	mounter mount.Mounter,
+	cfg *config.Config,
+	logger *slog.Logger,
+) (*NodeService, error) {
 	if mounter == nil {
 		return nil, fmt.Errorf("mounter cannot be nil")
 	}
 	if cfg == nil {
 		return nil, fmt.Errorf("config cannot be nil")
+	}
+	if logger == nil {
+		return nil, fmt.Errorf("logger cannot be nil")
 	}
 	if cfg.NodeID == "" {
 		return nil, fmt.Errorf("node ID cannot be empty")
@@ -53,6 +61,7 @@ func NewNodeService(mounter mount.Mounter, cfg *config.Config) (*NodeService, er
 	return &NodeService{
 		mounter: mounter,
 		cfg:     cfg,
+		logger:  logger,
 	}, nil
 }
 
@@ -143,6 +152,13 @@ func (s *NodeService) NodeStageVolume(
 			fsType = mount.DefaultFilesystemType
 		}
 		mountOptions := mountCap.GetMountFlags()
+
+		s.logger.InfoContext(
+			ctx,
+			"Staging device",
+			slog.String("volume_id", req.GetVolumeId()),
+			slog.String("fs_type", fsType),
+		)
 
 		err := s.mounter.FormatAndMount(
 			ctx,

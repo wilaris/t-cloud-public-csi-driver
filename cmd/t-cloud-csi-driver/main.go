@@ -36,7 +36,7 @@ func main() {
 		return
 	}
 	if err != nil {
-		logger.Error("driver startup failed", slog.Any("error", err))
+		logger.Error("Driver startup failed", slog.Any("error", err))
 		os.Exit(1)
 	}
 }
@@ -52,8 +52,8 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	server := grpc.NewServer()
-	if err := registerServices(ctx, server, cfg); err != nil {
+	server := grpc.NewServer(grpc.UnaryInterceptor(unaryLoggingInterceptor(logger)))
+	if err := registerServices(ctx, server, cfg, logger); err != nil {
 		return err
 	}
 
@@ -63,7 +63,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	logger.Info(
-		"serving csi",
+		"Serving CSI",
 		slog.String("role", string(cfg.Role)),
 		slog.String("driver", cfg.DriverName),
 		slog.String("version", cfg.Version),
@@ -73,8 +73,13 @@ func run(logger *slog.Logger) error {
 }
 
 // registerServices registers Identity and the service for cfg.Role.
-func registerServices(ctx context.Context, server *grpc.Server, cfg *config.Config) error {
-	identity, err := driver.NewIdentityService(cfg)
+func registerServices(
+	ctx context.Context,
+	server *grpc.Server,
+	cfg *config.Config,
+	logger *slog.Logger,
+) error {
+	identity, err := driver.NewIdentityService(cfg, logger)
 	if err != nil {
 		return fmt.Errorf("failed to construct identity service: %w", err)
 	}
@@ -82,9 +87,9 @@ func registerServices(ctx context.Context, server *grpc.Server, cfg *config.Conf
 
 	switch cfg.Role {
 	case config.RoleController:
-		return registerController(ctx, server, cfg)
+		return registerController(ctx, server, cfg, logger)
 	case config.RoleNode:
-		return registerNode(server, cfg)
+		return registerNode(server, cfg, logger)
 	default:
 		return fmt.Errorf("unsupported driver role %q", cfg.Role)
 	}
@@ -92,7 +97,12 @@ func registerServices(ctx context.Context, server *grpc.Server, cfg *config.Conf
 
 // registerController builds the controller path. EVS client construction authenticates, so bad
 // credentials fail at startup and a signal during that exchange stops it.
-func registerController(ctx context.Context, server *grpc.Server, cfg *config.Config) error {
+func registerController(
+	ctx context.Context,
+	server *grpc.Server,
+	cfg *config.Config,
+	logger *slog.Logger,
+) error {
 	evsClient, err := evs.NewClient(ctx, evs.Config{
 		AuthURL:       cfg.AuthURL,
 		AccessKey:     cfg.AccessKey.Value(),
@@ -105,7 +115,7 @@ func registerController(ctx context.Context, server *grpc.Server, cfg *config.Co
 		return fmt.Errorf("failed to construct EVS client: %w", err)
 	}
 
-	controller, err := driver.NewControllerService(evsClient, cfg)
+	controller, err := driver.NewControllerService(evsClient, cfg, logger)
 	if err != nil {
 		return fmt.Errorf("failed to construct controller service: %w", err)
 	}
@@ -115,8 +125,8 @@ func registerController(ctx context.Context, server *grpc.Server, cfg *config.Co
 }
 
 // registerNode builds the node-local half. No EVS client is constructed on this path.
-func registerNode(server *grpc.Server, cfg *config.Config) error {
-	node, err := driver.NewNodeService(mount.NewLinuxMounter(), cfg)
+func registerNode(server *grpc.Server, cfg *config.Config, logger *slog.Logger) error {
+	node, err := driver.NewNodeService(mount.NewLinuxMounter(), cfg, logger)
 	if err != nil {
 		return fmt.Errorf("failed to construct node service: %w", err)
 	}

@@ -4,6 +4,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -19,12 +20,15 @@ type IdentityService struct {
 
 	name    string
 	version string
+	logger  *slog.Logger
 }
 
-// NewIdentityService creates a new IdentityService with the provided configuration.
-func NewIdentityService(cfg *config.Config) (*IdentityService, error) {
+func NewIdentityService(cfg *config.Config, logger *slog.Logger) (*IdentityService, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("config cannot be nil")
+	}
+	if logger == nil {
+		return nil, fmt.Errorf("logger cannot be nil")
 	}
 	if cfg.DriverName == "" {
 		return nil, fmt.Errorf("driver name cannot be empty")
@@ -35,6 +39,7 @@ func NewIdentityService(cfg *config.Config) (*IdentityService, error) {
 	return &IdentityService{
 		name:    cfg.DriverName,
 		version: cfg.Version,
+		logger:  logger,
 	}, nil
 }
 

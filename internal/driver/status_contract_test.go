@@ -39,9 +39,7 @@ type rpcError struct {
 	err  error
 }
 
-// identityRPCs lists the implemented Identity RPCs. Together with controllerRPCs and nodeRPCs,
-// these lists drive the reachability and unadvertised tests, and the inventory test reconciles
-// them against the pinned generated interface.
+// identityRPCs lists implemented Identity RPCs for reachability, unadvertised and inventory tests.
 func identityRPCs(client csi.IdentityClient) (implemented, unadvertised []rpcCall) {
 	implemented = []rpcCall{
 		wireRPC("GetPluginInfo", client.GetPluginInfo),
@@ -208,15 +206,15 @@ func newContractClients(t *testing.T) contractClients {
 	cloud := &countingEVSClient{mockEVSClient: newMockEVSClient()}
 	hostCalls := new(int)
 
-	identityService, err := driver.NewIdentityService(cfg)
+	identityService, err := driver.NewIdentityService(cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewIdentityService failed: %v", err)
 	}
-	controllerService, err := driver.NewControllerService(cloud, cfg)
+	controllerService, err := driver.NewControllerService(cloud, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
-	nodeService, err := driver.NewNodeService(countingMounter(hostCalls), cfg)
+	nodeService, err := driver.NewNodeService(countingMounter(hostCalls), cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
@@ -250,11 +248,8 @@ func (c contractClients) assertNoEffects(t *testing.T) {
 	}
 }
 
-// implementedStatusErrors invokes every implemented Identity, Controller and Node RPC with an
-// empty request and reports each one that returns codes.Unimplemented, which means the service
-// stopped overriding it and the embedded generated stub is answering instead. Any other status
-// counts as reachable, including the codes.InvalidArgument an empty request usually returns, so
-// the check does not depend on each RPC's request validation.
+// implementedStatusErrors reports implemented RPCs that return Unimplemented (stub answering).
+// Other codes count as reachable so the check ignores per-RPC validation.
 func implementedStatusErrors(
 	ctx context.Context,
 	identityClient csi.IdentityClient,
@@ -509,10 +504,8 @@ func TestAdvertisedCapabilitiesHaveImplementedRPCs(t *testing.T) {
 	clients.assertNoEffects(t)
 }
 
-// TestGeneratedInterfaceInventoryIsCovered partitions every RPC of the pinned generated Identity,
-// Controller and Node interfaces into implemented and unadvertised sets, so a spec revision bump
-// that adds an RPC fails here until the contract above classifies it. Unadvertised services outside
-// Identity, Controller and Node are out of scope.
+// TestGeneratedInterfaceInventoryIsCovered fails if a generated Identity/Controller/Node RPC
+// is neither implemented nor marked unadvertised.
 func TestGeneratedInterfaceInventoryIsCovered(t *testing.T) {
 	t.Parallel()
 
@@ -571,8 +564,7 @@ func TestGeneratedInterfaceInventoryIsCovered(t *testing.T) {
 			)
 		}
 
-		// wireRPC only binds unary calls, so a streaming RPC cannot be classified above and
-		// would otherwise pass this inventory unnoticed.
+		// Streaming RPCs are not classified by wireRPC and must not pass silently.
 		for _, stream := range service.desc.Streams {
 			t.Errorf(
 				"%s/%s is a streaming RPC; this contract covers only unary RPCs and needs "+
@@ -687,10 +679,7 @@ func (unknownCapabilityNode) NodeGetCapabilities(
 	}, nil
 }
 
-// TestCapabilityCheckDetectsAnUnknownCapability verifies the capability check fails when a
-// service advertises a capability the contract does not know. The fake also leaves the other Node
-// RPCs unimplemented, which adds failures of its own, so the check searches the failures instead
-// of matching them exactly.
+// Soft match: the fake also leaves other Node RPCs unimplemented.
 func TestCapabilityCheckDetectsAnUnknownCapability(t *testing.T) {
 	t.Parallel()
 

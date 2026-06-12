@@ -95,7 +95,7 @@ func TestControllerPublishVolume_PublishesOnlyTheReportedDevicePath(t *testing.T
 				mockEVSClient: newMockEVSClient(),
 				deviceName:    tt.reported,
 			}
-			svc, err := driver.NewControllerService(cloud, validTestConfig())
+			svc, err := driver.NewControllerService(cloud, validTestConfig(), discardLogger())
 			if err != nil {
 				t.Fatalf("NewControllerService failed: %v", err)
 			}
@@ -162,7 +162,7 @@ func TestControllerPublishVolume_RepublishesTheSameDevicePath(t *testing.T) {
 	t.Parallel()
 
 	cloud := newMockEVSClient()
-	svc, err := driver.NewControllerService(cloud, validTestConfig())
+	svc, err := driver.NewControllerService(cloud, validTestConfig(), discardLogger())
 	if err != nil {
 		t.Fatalf("NewControllerService failed: %v", err)
 	}
@@ -354,7 +354,7 @@ func TestNodePublishVolume_RequiresThePublishedDevicePathForRawBlock(t *testing.
 					return "/dev/vdb", nil
 				},
 			}
-			svc, err := driver.NewNodeService(fm, validTestConfig())
+			svc, err := driver.NewNodeService(fm, validTestConfig(), discardLogger())
 			if err != nil {
 				t.Fatalf("NewNodeService failed: %v", err)
 			}
@@ -395,21 +395,21 @@ type unverifiedDevice struct {
 func unverifiedDevices() []unverifiedDevice {
 	return []unverifiedDevice{
 		{
-			name: "the publish context carries no device path",
+			name: "missing device path",
 			prepare: func(_ *testing.T, _ *emulatedHost) map[string]string {
 				return nil
 			},
 			wantCode: codes.InvalidArgument,
 		},
 		{
-			name: "the published device path is blank",
+			name: "blank device path",
 			prepare: func(_ *testing.T, _ *emulatedHost) map[string]string {
 				return map[string]string{devicePathContextKey: "   "}
 			},
 			wantCode: codes.InvalidArgument,
 		},
 		{
-			name: "the published device path is outside the node device directory",
+			name: "device path outside /dev",
 			prepare: func(t *testing.T, host *emulatedHost) map[string]string {
 				outside := filepath.Join(host.dir, "not-a-device")
 				if err := os.WriteFile(
@@ -424,7 +424,7 @@ func unverifiedDevices() []unverifiedDevice {
 			wantCode: codes.InvalidArgument,
 		},
 		{
-			name: "the published device path is absent on this node",
+			name: "device path missing on node",
 			prepare: func(_ *testing.T, host *emulatedHost) map[string]string {
 				return map[string]string{
 					devicePathContextKey: filepath.Join(devDirOf(host), "vdz"),
@@ -433,7 +433,7 @@ func unverifiedDevices() []unverifiedDevice {
 			wantCode: codes.NotFound,
 		},
 		{
-			name: "no by-id link identifies the volume",
+			name: "no by-id link for volume",
 			prepare: func(t *testing.T, host *emulatedHost) map[string]string {
 				if err := os.Remove(host.byIDLink); err != nil {
 					t.Fatalf("failed to remove the by-id link: %v", err)
@@ -443,7 +443,7 @@ func unverifiedDevices() []unverifiedDevice {
 			wantCode: codes.NotFound,
 		},
 		{
-			name: "the volume by-id link names another kernel device",
+			name: "by-id link points at different device",
 			prepare: func(t *testing.T, host *emulatedHost) map[string]string {
 				// Point the truncated serial link at a different device.
 				unrelated := filepath.Join(devDirOf(host), "vdc")

@@ -1,7 +1,9 @@
 package driver_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net"
 	"testing"
 
@@ -11,12 +13,25 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
+	"wilaris.dev/t-cloud-public-csi-driver/internal/log"
 )
 
 const bufSize = 1024 * 1024
 
-// serveCSI serves the services registered by register over an in-process connection and returns a
-// client connection to them. The connection, server, and listener are torn down with the test.
+// discardLogger is a no-op logger for tests that do not assert on log output.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
+}
+
+// captureLogger returns the production logger writing into a buffer (includes redaction).
+func captureLogger() (*slog.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+
+	return log.NewLogger(&buf, slog.LevelDebug), &buf
+}
+
+// serveCSI starts an in-process gRPC server with register and returns a client conn.
+// Conn, server and listener are cleaned up with t.Cleanup.
 func serveCSI(t *testing.T, register func(*grpc.Server)) *grpc.ClientConn {
 	t.Helper()
 
@@ -105,7 +120,7 @@ func accessModeCapability(mode csi.VolumeCapability_AccessMode_Mode) *csi.Volume
 }
 
 // mountCapability describes a mounted filesystem volume of the given type for the single-node
-// writer access mode. A test that fixes another access mode states its own capability.
+// writer access mode.
 func mountCapability(fsType string) *csi.VolumeCapability {
 	return &csi.VolumeCapability{
 		AccessType: &csi.VolumeCapability_Mount{

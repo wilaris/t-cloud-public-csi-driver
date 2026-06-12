@@ -51,7 +51,7 @@ func TestNewIdentityService_Validation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			svc, err := driver.NewIdentityService(tt.cfg)
+			svc, err := driver.NewIdentityService(tt.cfg, discardLogger())
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("NewIdentityService() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -66,7 +66,7 @@ func TestIdentityService_GRPC_GetPluginInfo(t *testing.T) {
 	t.Parallel()
 
 	cfg := validTestConfig()
-	svc, err := driver.NewIdentityService(cfg)
+	svc, err := driver.NewIdentityService(cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewIdentityService failed: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestIdentityService_GRPC_GetPluginCapabilities(t *testing.T) {
 	t.Parallel()
 
 	cfg := validTestConfig()
-	svc, err := driver.NewIdentityService(cfg)
+	svc, err := driver.NewIdentityService(cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewIdentityService failed: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestIdentityService_GRPC_Probe(t *testing.T) {
 	t.Parallel()
 
 	cfg := validTestConfig()
-	svc, err := driver.NewIdentityService(cfg)
+	svc, err := driver.NewIdentityService(cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewIdentityService failed: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestIdentityService_GRPC_CSISpecCompliance(t *testing.T) {
 	t.Parallel()
 
 	cfg := validTestConfig()
-	svc, err := driver.NewIdentityService(cfg)
+	svc, err := driver.NewIdentityService(cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewIdentityService failed: %v", err)
 	}
@@ -209,24 +209,17 @@ func TestIdentityService_GRPC_CSISpecCompliance(t *testing.T) {
 
 	name := info.GetName()
 	if name == "" {
-		t.Fatal("CSI spec requirement violation: plugin name must not be empty")
+		t.Fatal("plugin name must not be empty")
 	}
 	if len(name) > 63 {
-		t.Errorf(
-			"CSI spec requirement violation: plugin name %q exceeds maximum length of 63 characters (%d)",
-			name,
-			len(name),
-		)
+		t.Errorf("plugin name %q longer than 63 chars (%d)", name, len(name))
 	}
 	if !strings.Contains(name, ".") {
-		t.Errorf(
-			"CSI spec requirement violation: plugin name %q must follow reverse domain name notation",
-			name,
-		)
+		t.Errorf("plugin name %q must be reverse-domain notation", name)
 	}
 
 	if info.GetVendorVersion() == "" {
-		t.Fatal("CSI spec requirement violation: vendor_version must not be empty")
+		t.Fatal("vendor_version must not be empty")
 	}
 
 	probeRes, err := client.Probe(t.Context(), &csi.ProbeRequest{})
@@ -234,6 +227,6 @@ func TestIdentityService_GRPC_CSISpecCompliance(t *testing.T) {
 		t.Fatalf("Probe failed: %v", err)
 	}
 	if probeRes.GetReady() == nil || !probeRes.GetReady().GetValue() {
-		t.Errorf("CSI spec requirement violation: Probe response ready field must be true")
+		t.Errorf("Probe ready want true, got %v", probeRes.GetReady())
 	}
 }

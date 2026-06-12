@@ -171,7 +171,7 @@ func (h *emulatedHost) mountPointAt(path string) (mountutils.MountPoint, bool) {
 func newEmulatedNodeClient(t *testing.T, host *emulatedHost) csi.NodeClient {
 	t.Helper()
 
-	svc, err := driver.NewNodeService(host.mounter, validTestConfig())
+	svc, err := driver.NewNodeService(host.mounter, validTestConfig(), discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestNodeService_MountedVolumeLifecycleOnEmulatedHost(t *testing.T) {
 			host.table.MountPoints,
 		)
 	}
-	// Bind mount should surface the same device at the target.
+	// Bind mount should show the same device at the target.
 	if published.Device != host.devicePath {
 		t.Errorf("expected published device %s, got %s", host.devicePath, published.Device)
 	}
@@ -307,7 +307,7 @@ func TestNodeService_MountedVolumeLifecycleOnEmulatedHost(t *testing.T) {
 		t.Errorf("node teardown removed the attached device: %v", err)
 	}
 
-	// Idempotent teardown stays clean.
+	// Second unpublish/unstage must stay a no-op.
 	if _, err := client.NodeUnpublishVolume(ctx, unpublish); err != nil {
 		t.Errorf("repeated NodeUnpublishVolume failed: %v", err)
 	}
@@ -525,7 +525,7 @@ func TestNodeService_NodeGetInfoReportsNodeIDFromFlags(t *testing.T) {
 		t.Fatalf("config.Parse failed: %v", err)
 	}
 
-	svc, err := driver.NewNodeService(&fakeMounter{}, cfg)
+	svc, err := driver.NewNodeService(&fakeMounter{}, cfg, discardLogger())
 	if err != nil {
 		t.Fatalf("NewNodeService failed: %v", err)
 	}
