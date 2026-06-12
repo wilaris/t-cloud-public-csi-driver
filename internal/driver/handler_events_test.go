@@ -6,8 +6,8 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/driver"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/driver"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
 // Seeded volume ID/name pair used to assert logs carry ID only, not the caller-chosen name.

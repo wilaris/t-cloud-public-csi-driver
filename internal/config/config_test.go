@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/version"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/config"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/version"
 )
 
 func validEnvMap() map[string]string {

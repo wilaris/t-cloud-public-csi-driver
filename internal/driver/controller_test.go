@@ -13,8 +13,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/driver"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/driver"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
 type mockEVSClient struct {

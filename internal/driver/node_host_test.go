@@ -17,10 +17,10 @@ import (
 	mountutils "k8s.io/mount-utils"
 	k8sexec "k8s.io/utils/exec"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/driver"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/mount"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/mount/mounttest"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/config"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/driver"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/mount"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/mount/mounttest"
 )
 
 // emulatedVolumeID is long enough that udev truncates the virtio by-id serial.

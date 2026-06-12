@@ -17,12 +17,12 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/driver"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/log"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/mount"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/version"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/config"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/driver"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/log"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/mount"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/version"
 )
 
 // socketDirPerm is the permission mode for a created endpoint socket directory.

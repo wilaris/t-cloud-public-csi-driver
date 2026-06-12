@@ -11,7 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/config"
 )
 
 // IdentityService implements the csi.IdentityServer interface.

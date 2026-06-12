@@ -12,7 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/log"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/log"
 )
 
 const testMethod = "/csi.v1.Node/NodeStageVolume"

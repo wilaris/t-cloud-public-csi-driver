@@ -1,4 +1,4 @@
-module wilaris.dev/t-cloud-public-csi-driver
+module git.wilaris.dev/t-cloud-public-csi-driver
 
 go 1.26.0
 

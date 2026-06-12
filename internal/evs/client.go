@@ -15,7 +15,7 @@ import (
 	golangsdk "github.com/opentelekomcloud/gophertelekomcloud"
 	"github.com/opentelekomcloud/gophertelekomcloud/openstack"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/log"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/log"
 )
 
 var (

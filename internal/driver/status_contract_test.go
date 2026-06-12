@@ -12,8 +12,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/driver"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/driver"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
 type rpcCall struct {

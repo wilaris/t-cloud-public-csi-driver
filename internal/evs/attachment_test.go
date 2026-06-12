@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
 func TestAttachVolume_Validation(t *testing.T) {

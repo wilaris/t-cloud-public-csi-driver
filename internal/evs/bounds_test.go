@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
 // requestDeadline returns the deadline observed by the transport.

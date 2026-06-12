@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
 func TestCancelDuringReconcileReportsCanceled(t *testing.T) {

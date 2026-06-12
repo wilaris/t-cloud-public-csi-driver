@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
 func TestNewProviderClient_MissingRequiredConfig(t *testing.T) {

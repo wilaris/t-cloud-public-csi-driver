@@ -11,7 +11,7 @@ import (
 
 	golangsdk "github.com/opentelekomcloud/gophertelekomcloud"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/evs"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
 // Startup redirect and transient-status behavior.

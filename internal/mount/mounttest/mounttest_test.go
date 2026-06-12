@@ -6,7 +6,7 @@ import (
 
 	mountutils "k8s.io/mount-utils"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/mount/mounttest"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/mount/mounttest"
 )
 
 // Remount with nothing mounted must fail and leave the table empty.

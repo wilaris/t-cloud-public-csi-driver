@@ -51,7 +51,7 @@ BUILD_ID := $(VERSION) $(GIT_COMMIT) $(BUILD_DATE)
 BUILD_ID_FILE := $(BIN_DIR)/.build-id
 
 # Go formatting settings
-GOIMPORTS_FLAGS ?= -local wilaris.dev/t-cloud-public-csi-driver
+GOIMPORTS_FLAGS ?= -local git.wilaris.dev/t-cloud-public-csi-driver
 GOLINES_FLAGS ?= --base-formatter=gofmt
 GO_SOURCES := $(shell find . -name '*.go' \
 	-not -name '*.pb.go' \

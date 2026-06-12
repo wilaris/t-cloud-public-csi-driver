@@ -14,8 +14,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/config"
-	"wilaris.dev/t-cloud-public-csi-driver/internal/mount"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/config"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/mount"
 )
 
 const (

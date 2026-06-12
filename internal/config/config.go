@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/version"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/version"
 )
 
 const (

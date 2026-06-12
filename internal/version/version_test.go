@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"wilaris.dev/t-cloud-public-csi-driver/internal/version"
+	"git.wilaris.dev/t-cloud-public-csi-driver/internal/version"
 )
 
 func TestGetPopulatesEveryField(t *testing.T) {
