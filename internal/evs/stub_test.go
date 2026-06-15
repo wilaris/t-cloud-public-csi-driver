@@ -1,3 +1,5 @@
+// Package evs_test drives the EVS client from outside the package; HTTP is answered from a
+// script, not a stand-in cloud.
 package evs_test
 
 import (
@@ -13,8 +15,6 @@ import (
 	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
-// Tests use a scripted HTTP transport without simulating EVS state.
-
 const (
 	stubVolumeID   = "11111111-1111-1111-1111-111111111111"
 	stubVolumeName = "pvc-11111111-1111-1111-1111-111111111111"
@@ -23,7 +23,8 @@ const (
 	stubJobID      = "33333333-3333-3333-3333-333333333333"
 )
 
-// volumeDetailBody is one volume detail response carrying this driver's ownership marker.
+// volumeDetailBody is a volume-show body that already carries this driver's
+// ownership marker, so later checks do not fail as unowned.
 func volumeDetailBody(status string) string {
 	return fmt.Sprintf(
 		`{"volume":{"id":%q,"name":%q,"status":%q,"size":10,`+
@@ -36,7 +37,27 @@ func volumeDetailBody(status string) string {
 	)
 }
 
-// volumeListPageBody is one listing page holding a single volume, so a paged listing keeps advancing.
+// volumeDetailBodyWithAttachment is a volume-show body whose attachments
+// array names a server. That is how a volume reports an attach the compute
+// listing has not published yet.
+func volumeDetailBodyWithAttachment(status, serverID, device string) string {
+	return fmt.Sprintf(
+		`{"volume":{"id":%q,"name":%q,"status":%q,"size":10,`+
+			`"availability_zone":"eu-de-01","volume_type":"SSD","tags":{%q:%q},`+
+			`"attachments":[{"volume_id":%q,"server_id":%q,"device":%q}]}}`,
+		stubVolumeID,
+		stubVolumeName,
+		status,
+		evs.OwnershipTagKey,
+		evs.OwnershipTagValue,
+		stubVolumeID,
+		serverID,
+		device,
+	)
+}
+
+// volumeListPageBody is one listing page holding a single volume, so a paged
+// walk has a reason to request the next offset.
 func volumeListPageBody() string {
 	return fmt.Sprintf(
 		`{"volumes":[{"id":%q,"name":%q,"status":"available","size":10,`+
@@ -46,7 +67,8 @@ func volumeListPageBody() string {
 	)
 }
 
-// attachmentsBody is one attachment listing that reports the stub volume attached to the stub server.
+// attachmentsBody is a compute attachment listing that reports the stub
+// volume on the stub server at the given device path.
 func attachmentsBody(device string) string {
 	return fmt.Sprintf(
 		`{"volumeAttachments":[{"volumeId":%q,"serverId":%q,"device":%q}]}`,
@@ -60,6 +82,7 @@ const (
 	noAttachmentsBody = `{"volumeAttachments":[]}`
 	acceptedJobBody   = `{"job_id":"` + stubJobID + `"}`
 	runningJobBody    = `{"status":"RUNNING"}`
+	successJobBody    = `{"status":"SUCCESS","entities":{"volume_id":"` + stubVolumeID + `"}}`
 	blankJobBody      = `{}`
 )
 
@@ -77,16 +100,18 @@ type observedRequest struct {
 	hasDeadline bool
 }
 
-// stubTransport records requests and returns scripted answers in order, repeating the last.
-// It is not safe for concurrent use: each test must own its transport, and requests may only
-// be read after the operation under test has returned (mustFinish establishes that ordering).
+// stubTransport records each request and returns scripted answers in order,
+// then the last answer forever. One test owns one transport. requests() is
+// only safe after the operation under test has returned; mustFinish is the
+// sequencing point.
 type stubTransport struct {
 	script   []scriptedAnswer
 	repeat   scriptedAnswer
 	observed []observedRequest
 }
 
-// newStubTransport answers each request from script in order and repeats the last entry afterwards.
+// newStubTransport answers from script in order and then repeats the last
+// entry. An empty script is a test-authoring error.
 func newStubTransport(script ...scriptedAnswer) *stubTransport {
 	if len(script) == 0 {
 		panic("stub transport needs at least one answer")
@@ -94,7 +119,6 @@ func newStubTransport(script ...scriptedAnswer) *stubTransport {
 	return &stubTransport{script: script, repeat: script[len(script)-1]}
 }
 
-// RoundTrip records the request and returns the next scripted answer.
 func (s *stubTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	deadline, hasDeadline := req.Context().Deadline()
 
@@ -130,7 +154,7 @@ func (s *stubTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-// requests returns a copy of the observed requests.
+// requests returns a copy so later assertions cannot mutate the log.
 func (s *stubTransport) requests() []observedRequest {
 	return append([]observedRequest(nil), s.observed...)
 }
@@ -157,7 +181,7 @@ func assertRequests(t *testing.T, transport *stubTransport, want ...string) {
 	}
 }
 
-// stubConfig is a credential-shaped configuration that never reaches a network.
+// stubConfig is a well-formed credential set that must never leave the process.
 func stubConfig() evs.Config {
 	return evs.Config{
 		AuthURL:    "https://iam.example.invalid/v3",
@@ -168,8 +192,27 @@ func stubConfig() evs.Config {
 	}
 }
 
-// newStubClient builds a client using transport with SDK backoff disabled.
+// newStubClient builds a client over transport with SDK backoff disabled so
+// scripted answers are not retried by the SDK itself.
 func newStubClient(t *testing.T, cfg evs.Config, transport http.RoundTripper) *evs.Client {
+	t.Helper()
+	return newStubClientWithEndpoints(
+		t,
+		cfg,
+		transport,
+		"https://evs.example.invalid/v3/project/",
+		"https://evs.example.invalid/v2/project/",
+		"https://ecs.example.invalid/v1/project/",
+	)
+}
+
+// newStubClientWithEndpoints is newStubClient with caller-chosen service endpoints.
+func newStubClientWithEndpoints(
+	t *testing.T,
+	cfg evs.Config,
+	transport http.RoundTripper,
+	v3Endpoint, v2Endpoint, ecsEndpoint string,
+) *evs.Client {
 	t.Helper()
 
 	provider := new(golangsdk.ProviderClient)
@@ -185,14 +228,15 @@ func newStubClient(t *testing.T, cfg evs.Config, transport http.RoundTripper) *e
 	}
 
 	return evs.NewClientWithServiceClients(
-		serviceClient("https://evs.example.invalid/v3/project/"),
-		serviceClient("https://evs.example.invalid/v2/project/"),
-		serviceClient("https://ecs.example.invalid/v1/project/"),
+		serviceClient(v3Endpoint),
+		serviceClient(v2Endpoint),
+		serviceClient(ecsEndpoint),
 		cfg,
 	)
 }
 
-// newSocketClient uses a network connection to test request cancellation.
+// newSocketClient uses a real transport so a canceled context can abort an in-flight request on
+// an open connection.
 func newSocketClient(t *testing.T, cfg evs.Config, baseURL string) *evs.Client {
 	t.Helper()
 
@@ -220,7 +264,7 @@ func newSocketClient(t *testing.T, cfg evs.Config, baseURL string) *evs.Client {
 	)
 }
 
-// mustFinish fails if operation exceeds limit.
+// mustFinish fails the test if operation does not return within limit.
 func mustFinish(t *testing.T, limit time.Duration, operation func() error) error {
 	t.Helper()
 
@@ -229,10 +273,13 @@ func mustFinish(t *testing.T, limit time.Duration, operation func() error) error
 		done <- operation()
 	}()
 
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(limit):
+	case <-timer.C:
 		t.Fatalf("operation did not return within %s", limit)
 		return nil
 	}

@@ -29,7 +29,8 @@ var (
 	ErrMountFailed = errors.New("mount operation failed")
 	// ErrUnmountFailed indicates a failure during unmount execution.
 	ErrUnmountFailed = errors.New("unmount operation failed")
-	// ErrFilesystemMismatch indicates the device is formatted with a filesystem different from requested.
+	// ErrFilesystemMismatch indicates the device is formatted with a filesystem different from
+	// requested.
 	ErrFilesystemMismatch = errors.New("filesystem type mismatch")
 	// ErrFilesystemFormatFailed indicates formatting a device failed.
 	ErrFilesystemFormatFailed = errors.New("filesystem format failed")

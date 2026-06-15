@@ -21,7 +21,8 @@ func (s sampleAuthConfig) String() string {
 	return fmt.Sprintf("sampleAuthConfig{AK:%s, SK:%s}", s.OS_ACCESS_KEY, s.OS_SECRET_KEY)
 }
 
-// sampleAuthError is an error whose message embeds a secret (value receiver; typed nil panics if called).
+// sampleAuthError is an error whose message embeds a secret (value receiver; typed nil panics if
+// called).
 type sampleAuthError struct {
 	OS_SECRET_KEY string
 }

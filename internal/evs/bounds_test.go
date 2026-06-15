@@ -3,6 +3,7 @@ package evs_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,7 +12,9 @@ import (
 	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
-// requestDeadline returns the deadline observed by the transport.
+// requestDeadline records the deadline the client placed on a single GetVolume
+// call. That is the only way to see whether a caller deadline was kept or
+// replaced by the operation cap.
 func requestDeadline(ctx context.Context, t *testing.T) (time.Time, bool) {
 	t.Helper()
 
@@ -27,6 +30,48 @@ func requestDeadline(ctx context.Context, t *testing.T) (time.Time, bool) {
 		t.Fatalf("expected exactly one request, got %d", len(requests))
 	}
 	return requests[0].deadline, requests[0].hasDeadline
+}
+
+func TestDiscoverVolumeReadsPastAnIncompatibleFirstPage(t *testing.T) {
+	t.Parallel()
+
+	const laterID = "99999999-9999-9999-9999-999999999999"
+	first := fmt.Sprintf(
+		`{"volumes":[{"id":%q,"name":%q,"status":"available","size":10,`+
+			`"availability_zone":"eu-de-01","volume_type":"SSD","tags":{}}]}`,
+		stubVolumeID,
+		stubVolumeName,
+	)
+	later := fmt.Sprintf(
+		`{"volumes":[{"id":%q,"name":%q,"status":"available","size":10,`+
+			`"availability_zone":"eu-de-01","volume_type":"SSD","tags":{%q:%q}}]}`,
+		laterID,
+		stubVolumeName,
+		evs.OwnershipTagKey,
+		evs.OwnershipTagValue,
+	)
+	transport := newStubTransport(
+		scriptedAnswer{body: first},
+		scriptedAnswer{body: later},
+		scriptedAnswer{body: `{"volumes":[]}`},
+	)
+	client := newStubClient(t, stubConfig(), transport)
+
+	volume, err := client.DiscoverVolume(t.Context(), evs.DiscoverVolumeOpts{
+		Name:             stubVolumeName,
+		AvailabilityZone: "eu-de-01",
+		VolumeType:       "SSD",
+		MinSizeGiB:       10,
+	})
+	if err != nil {
+		t.Fatalf("DiscoverVolume() = %v", err)
+	}
+	if volume.ID != laterID {
+		t.Errorf("DiscoverVolume() ID = %q, want later-page candidate %q", volume.ID, laterID)
+	}
+	if got := len(transport.requests()); got != 3 {
+		t.Errorf("DiscoverVolume() made %d requests, want two pages and termination", got)
+	}
 }
 
 func TestOperationDeadlineBounds(t *testing.T) {
@@ -59,7 +104,8 @@ func TestOperationDeadlineBounds(t *testing.T) {
 	}
 }
 
-// An empty page after 50 full pages confirms completion at the bound.
+// Fifty full pages consume the listing cap. The empty page after them ends the walk; hitting the
+// cap exactly must not count as an overflow.
 func TestPagedListingEndingExactlyOnTheBoundSucceeds(t *testing.T) {
 	t.Parallel()
 
@@ -155,8 +201,11 @@ func TestEveryPollingLoopTerminates(t *testing.T) {
 				})
 				return err
 			},
+			// Only the effect and the first poll are required. A later poll
+			// needs the interval to beat the caller deadline, which a loaded
+			// machine cannot guarantee.
 			wantErr:      context.DeadlineExceeded,
-			wantRequests: []string{"POST /cloudvolumes", "GET /jobs/", "GET /jobs/"},
+			wantRequests: []string{"POST /cloudvolumes", "GET /jobs/"},
 		},
 		{
 			name: "attachment job wait",
@@ -171,7 +220,7 @@ func TestEveryPollingLoopTerminates(t *testing.T) {
 			},
 			wantErr: context.DeadlineExceeded,
 			wantRequests: []string{
-				"GET /block_device", "POST /attachvolume", "GET /jobs/", "GET /jobs/",
+				"GET /block_device", "POST /attachvolume", "GET /jobs/",
 			},
 		},
 		{
@@ -187,6 +236,27 @@ func TestEveryPollingLoopTerminates(t *testing.T) {
 			wantRequests: []string{"GET /block_device", "GET /block_device"},
 		},
 		{
+			name: "refused attach reconciliation",
+			script: []scriptedAnswer{
+				{body: noAttachmentsBody},
+				{status: http.StatusBadRequest, body: refusedAttachBody},
+				{body: volumeDetailBody("attaching")},
+				// Device name never arrives, so reconciliation keeps polling.
+				{body: attachmentsBody("")},
+			},
+			invoke: func(ctx context.Context, client *evs.Client) error {
+				_, err := client.AttachVolume(ctx, stubVolumeID, stubServerID)
+				return err
+			},
+			wantErr: context.DeadlineExceeded,
+			wantRequests: []string{
+				"GET /block_device",
+				"POST /attachvolume",
+				"GET /os-vendor-volumes/" + stubVolumeID,
+				"GET /block_device",
+			},
+		},
+		{
 			name: "deletion absence wait",
 			script: []scriptedAnswer{
 				{body: volumeDetailBody("available")},
@@ -200,7 +270,6 @@ func TestEveryPollingLoopTerminates(t *testing.T) {
 			wantRequests: []string{
 				"GET " + stubVolumeID,
 				"DELETE " + stubVolumeID,
-				"GET " + stubVolumeID,
 				"GET " + stubVolumeID,
 			},
 		},

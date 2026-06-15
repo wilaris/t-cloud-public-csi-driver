@@ -12,15 +12,22 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"git.wilaris.dev/t-cloud-public-csi-driver/internal/driver"
 	"git.wilaris.dev/t-cloud-public-csi-driver/internal/evs"
 )
 
+// mockAttachedDeviceName is the host path the fake cloud reports for a successful attach.
+const mockAttachedDeviceName = "/dev/vdb"
+
+// mockEVSClient is an in-memory EVSClient. It records creates so tests can assert
+// what the controller asked the cloud to provision.
 type mockEVSClient struct {
 	volumes     map[string]*evs.Volume
 	attachments map[string]string
 	lastCreate  evs.CreateVolumeOpts
+	createCalls int
 }
 
 func newMockEVSClient() *mockEVSClient {
@@ -31,10 +38,11 @@ func newMockEVSClient() *mockEVSClient {
 }
 
 func (m *mockEVSClient) CreateVolume(
-	ctx context.Context,
+	_ context.Context,
 	opts evs.CreateVolumeOpts,
 ) (*evs.Volume, error) {
 	m.lastCreate = opts
+	m.createCalls++
 	vol := &evs.Volume{
 		ID:               fmt.Sprintf("vol-%s", opts.Name),
 		Name:             opts.Name,
@@ -48,7 +56,7 @@ func (m *mockEVSClient) CreateVolume(
 	return vol, nil
 }
 
-func (m *mockEVSClient) GetVolume(ctx context.Context, id string) (*evs.Volume, error) {
+func (m *mockEVSClient) GetVolume(_ context.Context, id string) (*evs.Volume, error) {
 	vol, ok := m.volumes[id]
 	if !ok {
 		return nil, fmt.Errorf("volume %s: %w", id, evs.ErrNotFound)
@@ -57,7 +65,7 @@ func (m *mockEVSClient) GetVolume(ctx context.Context, id string) (*evs.Volume, 
 }
 
 func (m *mockEVSClient) DiscoverVolume(
-	ctx context.Context,
+	_ context.Context,
 	opts evs.DiscoverVolumeOpts,
 ) (*evs.Volume, error) {
 	nameExists := false
@@ -83,14 +91,13 @@ func (m *mockEVSClient) DiscoverVolume(
 		}
 		return vol, nil
 	}
-
 	if nameExists {
 		return nil, fmt.Errorf("volume %s: %w", opts.Name, evs.ErrConflict)
 	}
 	return nil, fmt.Errorf("volume %s: %w", opts.Name, evs.ErrNotFound)
 }
 
-func (m *mockEVSClient) DeleteVolume(ctx context.Context, id string) error {
+func (m *mockEVSClient) DeleteVolume(_ context.Context, id string) error {
 	vol, ok := m.volumes[id]
 	if !ok {
 		return fmt.Errorf("volume %s: %w", id, evs.ErrNotFound)
@@ -104,7 +111,7 @@ func (m *mockEVSClient) DeleteVolume(ctx context.Context, id string) error {
 }
 
 func (m *mockEVSClient) AttachVolume(
-	ctx context.Context,
+	_ context.Context,
 	volumeID, serverID string,
 ) (*evs.Attachment, error) {
 	if volumeID == "" || serverID == "" {
@@ -116,7 +123,6 @@ func (m *mockEVSClient) AttachVolume(
 	}
 	if currentServer, attached := m.attachments[volumeID]; attached {
 		if currentServer == serverID {
-			// Idempotent attach returns the same attachment.
 			return m.attachmentOf(volumeID, serverID), nil
 		}
 		return nil, fmt.Errorf(
@@ -131,10 +137,6 @@ func (m *mockEVSClient) AttachVolume(
 	return m.attachmentOf(volumeID, serverID), nil
 }
 
-// mockAttachedDeviceName is the device the mock cloud reports for an attachment.
-const mockAttachedDeviceName = "/dev/vdb"
-
-// attachmentOf builds the descriptor the attachment boundary returns for an attached volume.
 func (m *mockEVSClient) attachmentOf(volumeID, serverID string) *evs.Attachment {
 	return &evs.Attachment{
 		VolumeID:   volumeID,
@@ -143,13 +145,11 @@ func (m *mockEVSClient) attachmentOf(volumeID, serverID string) *evs.Attachment 
 	}
 }
 
-func (m *mockEVSClient) DetachVolume(ctx context.Context, volumeID, serverID string) error {
+func (m *mockEVSClient) DetachVolume(_ context.Context, volumeID, serverID string) error {
 	if volumeID == "" || serverID == "" {
 		return fmt.Errorf("detach volume: %w", evs.ErrInvalidArgument)
 	}
-	if _, ok := m.volumes[volumeID]; !ok {
-		return fmt.Errorf("volume %s: %w", volumeID, evs.ErrNotFound)
-	}
+	// A deleted volume has no attachment on this server, so detach is already done.
 	currentServer, attached := m.attachments[volumeID]
 	if !attached || currentServer != serverID {
 		return nil
@@ -161,103 +161,7 @@ func (m *mockEVSClient) DetachVolume(ctx context.Context, volumeID, serverID str
 	return nil
 }
 
-func TestNewControllerService(t *testing.T) {
-	t.Parallel()
-
-	client := newMockEVSClient()
-	cfg := validTestConfig()
-
-	svc, err := driver.NewControllerService(client, cfg, discardLogger())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if svc == nil {
-		t.Fatal("expected non-nil service")
-	}
-
-	_, err = driver.NewControllerService(nil, cfg, discardLogger())
-	if err == nil {
-		t.Error("expected error for nil client")
-	}
-
-	_, err = driver.NewControllerService(client, nil, discardLogger())
-	if err == nil {
-		t.Error("expected error for nil config")
-	}
-
-	_, err = driver.NewControllerService(client, cfg, nil)
-	if err == nil {
-		t.Error("expected error for nil logger")
-	}
-}
-
-func TestControllerGetCapabilities(t *testing.T) {
-	t.Parallel()
-
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
-	resp, err := svc.ControllerGetCapabilities(
-		t.Context(),
-		&csi.ControllerGetCapabilitiesRequest{},
-	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(resp.Capabilities) != 2 {
-		t.Fatalf("expected 2 capabilities, got %d", len(resp.Capabilities))
-	}
-	cap0 := resp.Capabilities[0].GetRpc().GetType()
-	if cap0 != csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME {
-		t.Errorf("expected CREATE_DELETE_VOLUME capability, got %v", cap0)
-	}
-	cap1 := resp.Capabilities[1].GetRpc().GetType()
-	if cap1 != csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME {
-		t.Errorf("expected PUBLISH_UNPUBLISH_VOLUME capability, got %v", cap1)
-	}
-}
-
-func TestControllerPublishVolume_HappyPath(t *testing.T) {
-	t.Parallel()
-
-	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(client, validTestConfig(), discardLogger())
-
-	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
-		Name:             "pub-vol",
-		Size:             1,
-		AvailabilityZone: "eu-de-01",
-		VolumeType:       "SSD",
-	})
-
-	req := &csi.ControllerPublishVolumeRequest{
-		VolumeId:         vol.ID,
-		NodeId:           "server-uuid-1234",
-		VolumeCapability: accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
-	}
-
-	resp, err := svc.ControllerPublishVolume(t.Context(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if resp == nil {
-		t.Fatal("expected non-nil response")
-	}
-	if got := resp.GetPublishContext()["devicePath"]; got != mockAttachedDeviceName {
-		t.Errorf(
-			"expected publish context devicePath %q, got %q",
-			mockAttachedDeviceName,
-			got,
-		)
-	}
-
-	// Verify volume status in mock
-	updatedVol, _ := client.GetVolume(t.Context(), vol.ID)
-	if updatedVol.Status != "in-use" {
-		t.Errorf("expected volume status in-use, got %s", updatedVol.Status)
-	}
-}
-
-// bareDeviceEVSClient reports a successful attachment whose device name the node cannot use.
+// bareDeviceEVSClient attaches successfully but names a device the node cannot open.
 type bareDeviceEVSClient struct {
 	*mockEVSClient
 }
@@ -274,22 +178,142 @@ func (c *bareDeviceEVSClient) AttachVolume(
 	return attachment, nil
 }
 
-func TestControllerPublishVolume_UnusableDevicePath(t *testing.T) {
-	t.Parallel()
+func mustController(t *testing.T, client driver.EVSClient) *driver.ControllerService {
+	t.Helper()
+	svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
+	if err != nil {
+		t.Fatalf("NewControllerService() = %v", err)
+	}
+	return svc
+}
 
-	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(
-		&bareDeviceEVSClient{client},
-		validTestConfig(),
-		discardLogger(),
-	)
-
-	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
-		Name:             "bare-device-vol",
+func mustSeedVolume(t *testing.T, client *mockEVSClient, name string) *evs.Volume {
+	t.Helper()
+	vol, err := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
+		Name:             name,
 		Size:             1,
 		AvailabilityZone: "eu-de-01",
 		VolumeType:       "SSD",
 	})
+	if err != nil {
+		t.Fatalf("CreateVolume(%q) = %v", name, err)
+	}
+	return vol
+}
+
+// requisiteZone pins CreateVolume to a single availability zone.
+func requisiteZone(zone string) *csi.TopologyRequirement {
+	return &csi.TopologyRequirement{
+		Requisite: []*csi.Topology{
+			{Segments: map[string]string{driver.TopologyZoneKey: zone}},
+		},
+	}
+}
+
+func TestNewControllerService(t *testing.T) {
+	t.Parallel()
+
+	client := newMockEVSClient()
+	cfg := validTestConfig()
+
+	svc, err := driver.NewControllerService(client, cfg, discardLogger())
+	if err != nil {
+		t.Fatalf("NewControllerService() = %v", err)
+	}
+	if svc == nil {
+		t.Fatal("NewControllerService() = nil, want service")
+	}
+
+	_, err = driver.NewControllerService(nil, cfg, discardLogger())
+	if err == nil {
+		t.Error("NewControllerService(nil client) = nil, want error")
+	}
+
+	_, err = driver.NewControllerService(client, nil, discardLogger())
+	if err == nil {
+		t.Error("NewControllerService(nil config) = nil, want error")
+	}
+
+	_, err = driver.NewControllerService(client, cfg, nil)
+	if err == nil {
+		t.Error("NewControllerService(nil logger) = nil, want error")
+	}
+}
+
+func TestControllerGetCapabilities(t *testing.T) {
+	t.Parallel()
+
+	svc := mustController(t, newMockEVSClient())
+	resp, err := svc.ControllerGetCapabilities(
+		t.Context(),
+		&csi.ControllerGetCapabilitiesRequest{},
+	)
+	if err != nil {
+		t.Fatalf("ControllerGetCapabilities() = %v", err)
+	}
+	if len(resp.Capabilities) != 2 {
+		t.Fatalf("ControllerGetCapabilities() len = %d, want 2", len(resp.Capabilities))
+	}
+	cap0 := resp.Capabilities[0].GetRpc().GetType()
+	if cap0 != csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME {
+		t.Errorf(
+			"ControllerGetCapabilities()[0] = %v, want CREATE_DELETE_VOLUME",
+			cap0,
+		)
+	}
+	cap1 := resp.Capabilities[1].GetRpc().GetType()
+	if cap1 != csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME {
+		t.Errorf(
+			"ControllerGetCapabilities()[1] = %v, want PUBLISH_UNPUBLISH_VOLUME",
+			cap1,
+		)
+	}
+}
+
+func TestControllerPublishVolume_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	client := newMockEVSClient()
+	svc := mustController(t, client)
+	vol := mustSeedVolume(t, client, "pub-vol")
+
+	req := &csi.ControllerPublishVolumeRequest{
+		VolumeId:         vol.ID,
+		NodeId:           "server-uuid-1234",
+		VolumeCapability: accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+	}
+	resp, err := svc.ControllerPublishVolume(t.Context(), req)
+	if err != nil {
+		t.Fatalf("ControllerPublishVolume() = %v", err)
+	}
+	if resp == nil {
+		t.Fatal("ControllerPublishVolume() = nil, want response")
+	}
+	if got := resp.GetPublishContext()["devicePath"]; got != mockAttachedDeviceName {
+		t.Errorf(
+			"ControllerPublishVolume() devicePath = %q, want %q",
+			got,
+			mockAttachedDeviceName,
+		)
+	}
+
+	updated, err := client.GetVolume(t.Context(), vol.ID)
+	if err != nil {
+		t.Fatalf("GetVolume(%q) = %v", vol.ID, err)
+	}
+	if updated.Status != "in-use" {
+		t.Errorf("GetVolume().Status = %q, want in-use", updated.Status)
+	}
+}
+
+func TestControllerPublishVolume_UnusableDevicePath(t *testing.T) {
+	t.Parallel()
+
+	// A successful attach that names "vdb" is unusable on the node, so the
+	// controller must report Internal instead of returning that path as OK.
+	client := newMockEVSClient()
+	svc := mustController(t, &bareDeviceEVSClient{client})
+	vol := mustSeedVolume(t, client, "bare-device-vol")
 
 	_, err := svc.ControllerPublishVolume(t.Context(), &csi.ControllerPublishVolumeRequest{
 		VolumeId:         vol.ID,
@@ -297,7 +321,7 @@ func TestControllerPublishVolume_UnusableDevicePath(t *testing.T) {
 		VolumeCapability: accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 	})
 	if status.Code(err) != codes.Internal {
-		t.Errorf("expected Internal for an unusable attachment device path, got: %v", err)
+		t.Errorf("ControllerPublishVolume() status = %v, want Internal", err)
 	}
 }
 
@@ -305,96 +329,103 @@ func TestControllerPublishVolume_Idempotency(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(client, validTestConfig(), discardLogger())
-
-	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
-		Name:             "idempotent-pub-vol",
-		Size:             1,
-		AvailabilityZone: "eu-de-01",
-		VolumeType:       "SSD",
-	})
+	svc := mustController(t, client)
+	vol := mustSeedVolume(t, client, "idempotent-pub-vol")
 
 	req := &csi.ControllerPublishVolumeRequest{
 		VolumeId:         vol.ID,
 		NodeId:           "server-uuid-1234",
 		VolumeCapability: accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 	}
-
-	// First publish
-	_, err := svc.ControllerPublishVolume(t.Context(), req)
-	if err != nil {
-		t.Fatalf("first publish failed: %v", err)
+	if _, err := svc.ControllerPublishVolume(t.Context(), req); err != nil {
+		t.Fatalf("ControllerPublishVolume() first = %v", err)
+	}
+	if _, err := svc.ControllerPublishVolume(t.Context(), req); err != nil {
+		t.Fatalf("ControllerPublishVolume() second = %v", err)
 	}
 
-	// Second publish to same node -> idempotent success
-	_, err = svc.ControllerPublishVolume(t.Context(), req)
-	if err != nil {
-		t.Fatalf("second publish failed: %v", err)
-	}
-
-	// Publish to different node -> conflict error
-	diffNodeReq := &csi.ControllerPublishVolumeRequest{
+	// Already attached elsewhere: the CO must unpublish the other node first.
+	_, err := svc.ControllerPublishVolume(t.Context(), &csi.ControllerPublishVolumeRequest{
 		VolumeId:         vol.ID,
 		NodeId:           "server-uuid-5678",
 		VolumeCapability: req.VolumeCapability,
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("ControllerPublishVolume(other node) status = %v, want FailedPrecondition", err)
 	}
-	_, err = svc.ControllerPublishVolume(t.Context(), diffNodeReq)
-	if status.Code(err) != codes.AlreadyExists && status.Code(err) != codes.FailedPrecondition {
-		t.Errorf(
-			"expected conflict/already exists error for publishing to different node, got %v",
-			err,
-		)
+}
+
+func TestControllerPublishVolume_NonexistentVolume(t *testing.T) {
+	t.Parallel()
+
+	svc := mustController(t, newMockEVSClient())
+	_, err := svc.ControllerPublishVolume(t.Context(), &csi.ControllerPublishVolumeRequest{
+		VolumeId:         "vol-missing",
+		NodeId:           "server-uuid-1234",
+		VolumeCapability: accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Errorf("ControllerPublishVolume(missing) status = %v, want NotFound", err)
 	}
 }
 
 func TestControllerPublishVolume_ValidationFailures(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
+	svc := mustController(t, newMockEVSClient())
+	writer := accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
 
-	// Nil request
-	_, err := svc.ControllerPublishVolume(t.Context(), nil)
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for nil request, got %v", err)
+	tests := []struct {
+		name string
+		req  *csi.ControllerPublishVolumeRequest
+	}{
+		{name: "nil request"},
+		{
+			name: "empty volume_id",
+			req: &csi.ControllerPublishVolumeRequest{
+				NodeId:           "node-1",
+				VolumeCapability: writer,
+			},
+		},
+		{
+			name: "empty node_id",
+			req: &csi.ControllerPublishVolumeRequest{
+				VolumeId:         "vol-1",
+				VolumeCapability: writer,
+			},
+		},
+		{
+			name: "nil capability",
+			req: &csi.ControllerPublishVolumeRequest{
+				VolumeId: "vol-1",
+				NodeId:   "node-1",
+			},
+		},
+		{
+			name: "multi-node mode",
+			req: &csi.ControllerPublishVolumeRequest{
+				VolumeId: "vol-1",
+				NodeId:   "node-1",
+				VolumeCapability: accessModeCapability(
+					csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+				),
+			},
+		},
 	}
 
-	// Empty volume ID
-	_, err = svc.ControllerPublishVolume(t.Context(), &csi.ControllerPublishVolumeRequest{
-		NodeId:           "node-1",
-		VolumeCapability: accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
-	})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for empty volume_id, got %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	// Empty node ID
-	_, err = svc.ControllerPublishVolume(t.Context(), &csi.ControllerPublishVolumeRequest{
-		VolumeId:         "vol-1",
-		VolumeCapability: accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
-	})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for empty node_id, got %v", err)
-	}
-
-	// Nil capability
-	_, err = svc.ControllerPublishVolume(t.Context(), &csi.ControllerPublishVolumeRequest{
-		VolumeId: "vol-1",
-		NodeId:   "node-1",
-	})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for nil capability, got %v", err)
-	}
-
-	// Unsupported capability mode (multi-node)
-	_, err = svc.ControllerPublishVolume(t.Context(), &csi.ControllerPublishVolumeRequest{
-		VolumeId: "vol-1",
-		NodeId:   "node-1",
-		VolumeCapability: accessModeCapability(
-			csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
-		),
-	})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for multi-node mode, got %v", err)
+			_, err := svc.ControllerPublishVolume(t.Context(), tt.req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Errorf(
+					"ControllerPublishVolume(%s) status = %v, want InvalidArgument",
+					tt.name,
+					err,
+				)
+			}
+		})
 	}
 }
 
@@ -402,75 +433,92 @@ func TestControllerUnpublishVolume_HappyPath(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(client, validTestConfig(), discardLogger())
+	svc := mustController(t, client)
+	vol := mustSeedVolume(t, client, "unpub-vol")
 
-	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
-		Name:             "unpub-vol",
-		Size:             1,
-		AvailabilityZone: "eu-de-01",
-		VolumeType:       "SSD",
-	})
-
-	_, _ = client.AttachVolume(t.Context(), vol.ID, "server-uuid-1234")
+	if _, err := client.AttachVolume(t.Context(), vol.ID, "server-uuid-1234"); err != nil {
+		t.Fatalf("AttachVolume() = %v", err)
+	}
 
 	req := &csi.ControllerUnpublishVolumeRequest{
 		VolumeId: vol.ID,
 		NodeId:   "server-uuid-1234",
 	}
-
 	resp, err := svc.ControllerUnpublishVolume(t.Context(), req)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("ControllerUnpublishVolume() = %v", err)
 	}
 	if resp == nil {
-		t.Fatal("expected non-nil response")
+		t.Fatal("ControllerUnpublishVolume() = nil, want response")
+	}
+	if _, err := svc.ControllerUnpublishVolume(t.Context(), req); err != nil {
+		t.Fatalf("ControllerUnpublishVolume() second = %v", err)
+	}
+}
+
+func TestControllerUnpublishVolume_AfterDelete(t *testing.T) {
+	t.Parallel()
+
+	// After DeleteVolume the volume is gone; Unpublish must still succeed so
+	// the CO can finish cleanup without treating absence as a failure.
+	client := newMockEVSClient()
+	svc := mustController(t, client)
+	vol := mustSeedVolume(t, client, "unpub-after-delete-vol")
+
+	_, err := svc.DeleteVolume(t.Context(), &csi.DeleteVolumeRequest{VolumeId: vol.ID})
+	if err != nil {
+		t.Fatalf("DeleteVolume() = %v", err)
 	}
 
-	// Idempotent unpublish
-	_, err = svc.ControllerUnpublishVolume(t.Context(), req)
+	_, err = svc.ControllerUnpublishVolume(t.Context(), &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: vol.ID,
+		NodeId:   "server-uuid-1234",
+	})
 	if err != nil {
-		t.Fatalf("unexpected error on second unpublish: %v", err)
+		t.Fatalf("ControllerUnpublishVolume() after delete = %v, want success", err)
 	}
 }
 
 func TestControllerUnpublishVolume_ValidationFailures(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
+	svc := mustController(t, newMockEVSClient())
 
-	// Nil request
-	_, err := svc.ControllerUnpublishVolume(t.Context(), nil)
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for nil request, got %v", err)
+	tests := []struct {
+		name string
+		req  *csi.ControllerUnpublishVolumeRequest
+	}{
+		{name: "nil request"},
+		{
+			name: "empty volume_id",
+			req:  &csi.ControllerUnpublishVolumeRequest{NodeId: "node-1"},
+		},
+		{
+			name: "empty node_id",
+			req:  &csi.ControllerUnpublishVolumeRequest{VolumeId: "vol-1"},
+		},
 	}
 
-	// Empty volume ID
-	_, err = svc.ControllerUnpublishVolume(
-		t.Context(),
-		&csi.ControllerUnpublishVolumeRequest{
-			NodeId: "node-1",
-		},
-	)
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for empty volume_id, got %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	// Empty node ID
-	_, err = svc.ControllerUnpublishVolume(
-		t.Context(),
-		&csi.ControllerUnpublishVolumeRequest{
-			VolumeId: "vol-1",
-		},
-	)
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for empty node_id, got %v", err)
+			_, err := svc.ControllerUnpublishVolume(t.Context(), tt.req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Errorf(
+					"ControllerUnpublishVolume(%s) status = %v, want InvalidArgument",
+					tt.name,
+					err,
+				)
+			}
+		})
 	}
 }
 
 func TestCreateVolume_HappyPath(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
+	svc := mustController(t, newMockEVSClient())
 	req := &csi.CreateVolumeRequest{
 		Name: "test-volume",
 		CapacityRange: &csi.CapacityRange{
@@ -495,18 +543,23 @@ func TestCreateVolume_HappyPath(t *testing.T) {
 
 	resp, err := svc.CreateVolume(t.Context(), req)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("CreateVolume() = %v", err)
 	}
-
 	if resp.Volume.VolumeId == "" {
-		t.Error("expected non-empty VolumeId")
+		t.Error("CreateVolume() VolumeId is empty")
 	}
 	if resp.Volume.CapacityBytes != 10*1024*1024*1024 {
-		t.Errorf("expected capacity 10GiB, got %d", resp.Volume.CapacityBytes)
+		t.Errorf(
+			"CreateVolume() CapacityBytes = %d, want 10GiB",
+			resp.Volume.CapacityBytes,
+		)
 	}
 	if len(resp.Volume.AccessibleTopology) != 1 ||
 		resp.Volume.AccessibleTopology[0].Segments[driver.TopologyZoneKey] != "eu-de-01" {
-		t.Errorf("unexpected accessible topology: %+v", resp.Volume.AccessibleTopology)
+		t.Errorf(
+			"CreateVolume() AccessibleTopology = %+v, want eu-de-01",
+			resp.Volume.AccessibleTopology,
+		)
 	}
 }
 
@@ -516,16 +569,16 @@ func TestCreateVolume_TopologyRoundTrip(t *testing.T) {
 	cfg := validTestConfig()
 	identityService, err := driver.NewIdentityService(cfg, discardLogger())
 	if err != nil {
-		t.Fatalf("NewIdentityService failed: %v", err)
+		t.Fatalf("NewIdentityService() = %v", err)
 	}
 	nodeService, err := driver.NewNodeService(&fakeMounter{}, cfg, discardLogger())
 	if err != nil {
-		t.Fatalf("NewNodeService failed: %v", err)
+		t.Fatalf("NewNodeService() = %v", err)
 	}
 	evsClient := newMockEVSClient()
 	controllerService, err := driver.NewControllerService(evsClient, cfg, discardLogger())
 	if err != nil {
-		t.Fatalf("NewControllerService failed: %v", err)
+		t.Fatalf("NewControllerService() = %v", err)
 	}
 
 	conn := serveCSI(t, func(server *grpc.Server) {
@@ -540,7 +593,7 @@ func TestCreateVolume_TopologyRoundTrip(t *testing.T) {
 		&csi.GetPluginCapabilitiesRequest{},
 	)
 	if err != nil {
-		t.Fatalf("GetPluginCapabilities failed: %v", err)
+		t.Fatalf("GetPluginCapabilities() = %v", err)
 	}
 	topologySupported := false
 	for _, capability := range capabilities.GetCapabilities() {
@@ -551,24 +604,24 @@ func TestCreateVolume_TopologyRoundTrip(t *testing.T) {
 		}
 	}
 	if !topologySupported {
-		t.Fatal("VOLUME_ACCESSIBILITY_CONSTRAINTS is not advertised")
+		t.Fatal("GetPluginCapabilities() missing VOLUME_ACCESSIBILITY_CONSTRAINTS")
 	}
 
 	nodeClient := csi.NewNodeClient(conn)
 	nodeInfo, err := nodeClient.NodeGetInfo(t.Context(), &csi.NodeGetInfoRequest{})
 	if err != nil {
-		t.Fatalf("NodeGetInfo failed: %v", err)
+		t.Fatalf("NodeGetInfo() = %v", err)
 	}
 	nodeTopology := nodeInfo.GetAccessibleTopology()
 	if nodeTopology == nil {
-		t.Fatal("NodeGetInfo did not return accessible topology")
+		t.Fatal("NodeGetInfo() AccessibleTopology = nil")
 	}
 	nodeZone, ok := nodeTopology.GetSegments()[driver.TopologyZoneKey]
 	if !ok {
-		t.Fatalf("NodeGetInfo topology does not contain %q", driver.TopologyZoneKey)
+		t.Fatalf("NodeGetInfo() topology missing %q", driver.TopologyZoneKey)
 	}
 	if nodeZone != cfg.AvailabilityZone {
-		t.Fatalf("expected node zone %q, got %q", cfg.AvailabilityZone, nodeZone)
+		t.Fatalf("NodeGetInfo() zone = %q, want %q", nodeZone, cfg.AvailabilityZone)
 	}
 
 	controllerClient := csi.NewControllerClient(conn)
@@ -586,34 +639,34 @@ func TestCreateVolume_TopologyRoundTrip(t *testing.T) {
 	}
 	requestZone := request.GetAccessibilityRequirements().GetRequisite()[0].GetSegments()[driver.TopologyZoneKey]
 	if requestZone != nodeZone {
-		t.Fatalf("expected Controller request zone %q, got %q", nodeZone, requestZone)
+		t.Fatalf("CreateVolume request zone = %q, want %q", requestZone, nodeZone)
 	}
 
 	created, err := controllerClient.CreateVolume(t.Context(), request)
 	if err != nil {
-		t.Fatalf("CreateVolume failed: %v", err)
+		t.Fatalf("CreateVolume() = %v", err)
 	}
 	if evsClient.lastCreate.AvailabilityZone != requestZone {
 		t.Fatalf(
-			"expected EVS create zone %q, got %q",
-			requestZone,
+			"EVS create zone = %q, want %q",
 			evsClient.lastCreate.AvailabilityZone,
+			requestZone,
 		)
 	}
 
 	accessibleTopology := created.GetVolume().GetAccessibleTopology()
 	if len(accessibleTopology) != 1 {
-		t.Fatalf("expected one accessible topology, got %d", len(accessibleTopology))
+		t.Fatalf("CreateVolume() topology len = %d, want 1", len(accessibleTopology))
 	}
 	createdZone, ok := accessibleTopology[0].GetSegments()[driver.TopologyZoneKey]
 	if !ok {
-		t.Fatalf("created volume topology does not contain %q", driver.TopologyZoneKey)
+		t.Fatalf("CreateVolume() topology missing %q", driver.TopologyZoneKey)
 	}
 	if createdZone != evsClient.lastCreate.AvailabilityZone {
 		t.Errorf(
-			"expected created volume zone %q, got %q",
-			evsClient.lastCreate.AvailabilityZone,
+			"CreateVolume() zone = %q, want %q",
 			createdZone,
+			evsClient.lastCreate.AvailabilityZone,
 		)
 	}
 }
@@ -621,7 +674,8 @@ func TestCreateVolume_TopologyRoundTrip(t *testing.T) {
 func TestCreateVolume_Idempotency(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
+	evsClient := newMockEVSClient()
+	svc := mustController(t, evsClient)
 	req := &csi.CreateVolumeRequest{
 		Name: "idempotent-vol",
 		CapacityRange: &csi.CapacityRange{
@@ -642,20 +696,17 @@ func TestCreateVolume_Idempotency(t *testing.T) {
 
 	resp1, err := svc.CreateVolume(t.Context(), req)
 	if err != nil {
-		t.Fatalf("first CreateVolume failed: %v", err)
+		t.Fatalf("CreateVolume() first = %v", err)
 	}
-
 	resp2, err := svc.CreateVolume(t.Context(), req)
 	if err != nil {
-		t.Fatalf("second CreateVolume failed: %v", err)
+		t.Fatalf("CreateVolume() second = %v", err)
 	}
-
-	if resp1.Volume.VolumeId != resp2.Volume.VolumeId {
-		t.Errorf(
-			"expected identical volume ID, got %s and %s",
-			resp1.Volume.VolumeId,
-			resp2.Volume.VolumeId,
-		)
+	if !proto.Equal(resp1.Volume, resp2.Volume) {
+		t.Error("CreateVolume() repeated volume contract differs")
+	}
+	if evsClient.createCalls != 1 {
+		t.Errorf("CreateVolume() EVS creates = %d, want 1", evsClient.createCalls)
 	}
 
 	compatibleReq := &csi.CreateVolumeRequest{
@@ -668,17 +719,19 @@ func TestCreateVolume_Idempotency(t *testing.T) {
 		Parameters:                req.Parameters,
 		AccessibilityRequirements: req.AccessibilityRequirements,
 	}
-
 	resp3, err := svc.CreateVolume(t.Context(), compatibleReq)
 	if err != nil {
-		t.Fatalf("compatible CreateVolume retry failed: %v", err)
+		t.Fatalf("CreateVolume() compatible retry = %v", err)
 	}
 	if resp3.Volume.VolumeId != resp1.Volume.VolumeId {
 		t.Errorf(
-			"expected compatible retry to return volume ID %s, got %s",
-			resp1.Volume.VolumeId,
+			"CreateVolume() compatible VolumeId = %s, want %s",
 			resp3.Volume.VolumeId,
+			resp1.Volume.VolumeId,
 		)
+	}
+	if evsClient.createCalls != 1 {
+		t.Errorf("CreateVolume() compatible EVS creates = %d, want 1", evsClient.createCalls)
 	}
 }
 
@@ -741,14 +794,10 @@ func TestCreateVolume_IdempotencyRejectsIncompatibleVolume(t *testing.T) {
 				VolumeType:       tt.volumeType,
 			})
 			if err != nil {
-				t.Fatalf("create existing volume: %v", err)
+				t.Fatalf("CreateVolume(existing) = %v", err)
 			}
 
-			svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
-			if err != nil {
-				t.Fatalf("NewControllerService failed: %v", err)
-			}
-
+			svc := mustController(t, client)
 			_, err = svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{
 				Name: "existing-volume",
 				CapacityRange: &csi.CapacityRange{
@@ -768,7 +817,11 @@ func TestCreateVolume_IdempotencyRejectsIncompatibleVolume(t *testing.T) {
 				},
 			})
 			if status.Code(err) != codes.AlreadyExists {
-				t.Errorf("expected AlreadyExists for incompatible volume, got %v", err)
+				t.Errorf(
+					"CreateVolume(%s) status = %v, want AlreadyExists",
+					tt.name,
+					err,
+				)
 			}
 		})
 	}
@@ -777,8 +830,8 @@ func TestCreateVolume_IdempotencyRejectsIncompatibleVolume(t *testing.T) {
 func TestCreateVolume_UnsupportedAccessMode(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
-	req := &csi.CreateVolumeRequest{
+	svc := mustController(t, newMockEVSClient())
+	_, err := svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{
 		Name: "multi-node-vol",
 		VolumeCapabilities: []*csi.VolumeCapability{
 			accessModeCapability(csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER),
@@ -788,70 +841,70 @@ func TestCreateVolume_UnsupportedAccessMode(t *testing.T) {
 				{Segments: map[string]string{driver.TopologyZoneKey: "eu-de-01"}},
 			},
 		},
-	}
-
-	_, err := svc.CreateVolume(t.Context(), req)
+	})
 	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for multi-node access mode, got %v", err)
+		t.Errorf("CreateVolume(multi-node) status = %v, want InvalidArgument", err)
 	}
 }
 
 func TestCreateVolume_ValidationFailures(t *testing.T) {
 	t.Parallel()
 
-	svc, _ := driver.NewControllerService(newMockEVSClient(), validTestConfig(), discardLogger())
-
-	// Nil request
-	_, err := svc.CreateVolume(t.Context(), nil)
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for nil request, got %v", err)
+	svc := mustController(t, newMockEVSClient())
+	writer := []*csi.VolumeCapability{
+		accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 	}
+	params := map[string]string{"type": "SSD"}
 
-	// Empty name
-	_, err = svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for empty name, got %v", err)
-	}
-
-	// Empty capabilities
-	_, err = svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{Name: "vol-1"})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for empty capabilities, got %v", err)
-	}
-
-	// Missing availability zone
-	reqMissingZone := &csi.CreateVolumeRequest{
-		Name: "vol-no-zone",
-		VolumeCapabilities: []*csi.VolumeCapability{
-			accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
+	tests := []struct {
+		name string
+		req  *csi.CreateVolumeRequest
+	}{
+		{name: "nil request"},
+		{
+			name: "empty name",
+			req:  &csi.CreateVolumeRequest{},
 		},
-		Parameters: map[string]string{
-			"type": "SSD",
+		{
+			name: "empty capabilities",
+			req:  &csi.CreateVolumeRequest{Name: "vol-1"},
 		},
-	}
-	_, err = svc.CreateVolume(t.Context(), reqMissingZone)
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for missing zone, got %v", err)
-	}
-
-	// Invalid capacity range
-	reqBadCap := &csi.CreateVolumeRequest{
-		Name: "vol-bad-cap",
-		CapacityRange: &csi.CapacityRange{
-			RequiredBytes: 100 * 1024 * 1024 * 1024,
-			LimitBytes:    10 * 1024 * 1024 * 1024,
+		{
+			name: "missing zone",
+			req: &csi.CreateVolumeRequest{
+				Name:               "vol-no-zone",
+				VolumeCapabilities: writer,
+				Parameters:         params,
+			},
 		},
-		VolumeCapabilities: reqMissingZone.VolumeCapabilities,
-		Parameters:         reqMissingZone.Parameters,
-		AccessibilityRequirements: &csi.TopologyRequirement{
-			Requisite: []*csi.Topology{
-				{Segments: map[string]string{driver.TopologyZoneKey: "eu-de-01"}},
+		{
+			name: "required above limit",
+			req: &csi.CreateVolumeRequest{
+				Name: "vol-bad-cap",
+				CapacityRange: &csi.CapacityRange{
+					RequiredBytes: 100 * 1024 * 1024 * 1024,
+					LimitBytes:    10 * 1024 * 1024 * 1024,
+				},
+				VolumeCapabilities:        writer,
+				Parameters:                params,
+				AccessibilityRequirements: requisiteZone("eu-de-01"),
 			},
 		},
 	}
-	_, err = svc.CreateVolume(t.Context(), reqBadCap)
-	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for required > limit bytes, got %v", err)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := svc.CreateVolume(t.Context(), tt.req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Errorf(
+					"CreateVolume(%s) status = %v, want InvalidArgument",
+					tt.name,
+					err,
+				)
+			}
+		})
 	}
 }
 
@@ -859,36 +912,26 @@ func TestDeleteVolume(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(client, validTestConfig(), discardLogger())
+	svc := mustController(t, client)
+	vol := mustSeedVolume(t, client, "del-vol")
 
-	// Create a volume directly in mock
-	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
-		Name:             "del-vol",
-		Size:             1,
-		AvailabilityZone: "eu-de-01",
-		VolumeType:       "SSD",
-	})
-
-	// Delete existing volume
 	_, err := svc.DeleteVolume(t.Context(), &csi.DeleteVolumeRequest{
 		VolumeId: vol.ID,
 	})
 	if err != nil {
-		t.Fatalf("unexpected error deleting volume: %v", err)
+		t.Fatalf("DeleteVolume() = %v", err)
 	}
 
-	// Idempotent delete of already deleted volume -> expected OK
 	_, err = svc.DeleteVolume(t.Context(), &csi.DeleteVolumeRequest{
 		VolumeId: vol.ID,
 	})
 	if err != nil {
-		t.Fatalf("unexpected error deleting already deleted volume: %v", err)
+		t.Fatalf("DeleteVolume() already deleted = %v", err)
 	}
 
-	// Validation: empty volume ID
 	_, err = svc.DeleteVolume(t.Context(), &csi.DeleteVolumeRequest{})
 	if status.Code(err) != codes.InvalidArgument {
-		t.Errorf("expected InvalidArgument for empty volume_id, got %v", err)
+		t.Errorf("DeleteVolume(empty id) status = %v, want InvalidArgument", err)
 	}
 }
 
@@ -896,20 +939,12 @@ func TestValidateVolumeCapabilities(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, _ := driver.NewControllerService(client, validTestConfig(), discardLogger())
-
-	vol, _ := client.CreateVolume(t.Context(), evs.CreateVolumeOpts{
-		Name:             "val-vol",
-		Size:             1,
-		AvailabilityZone: "eu-de-01",
-		VolumeType:       "SSD",
-	})
+	svc := mustController(t, client)
+	vol := mustSeedVolume(t, client, "val-vol")
 
 	validCaps := []*csi.VolumeCapability{
 		accessModeCapability(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER),
 	}
-
-	// Valid capabilities
 	resp, err := svc.ValidateVolumeCapabilities(
 		t.Context(),
 		&csi.ValidateVolumeCapabilitiesRequest{
@@ -918,13 +953,12 @@ func TestValidateVolumeCapabilities(t *testing.T) {
 		},
 	)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("ValidateVolumeCapabilities() = %v", err)
 	}
 	if resp.Confirmed == nil {
-		t.Error("expected non-nil Confirmed for valid capability")
+		t.Error("ValidateVolumeCapabilities() Confirmed = nil, want set")
 	}
 
-	// Unsupported access mode
 	invalidCaps := []*csi.VolumeCapability{
 		accessModeCapability(csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER),
 	}
@@ -936,13 +970,12 @@ func TestValidateVolumeCapabilities(t *testing.T) {
 		},
 	)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("ValidateVolumeCapabilities(multi-node) = %v", err)
 	}
 	if resp.Confirmed != nil {
-		t.Error("expected nil Confirmed for unsupported access mode")
+		t.Error("ValidateVolumeCapabilities(multi-node) Confirmed set, want nil")
 	}
 
-	// Volume not found
 	_, err = svc.ValidateVolumeCapabilities(
 		t.Context(),
 		&csi.ValidateVolumeCapabilitiesRequest{
@@ -951,20 +984,10 @@ func TestValidateVolumeCapabilities(t *testing.T) {
 		},
 	)
 	if status.Code(err) != codes.NotFound {
-		t.Errorf("expected NotFound for non-existent volume, got %v", err)
+		t.Errorf("ValidateVolumeCapabilities(missing) status = %v, want NotFound", err)
 	}
 }
 
-// requisiteZone describes a topology requirement fixing one availability zone.
-func requisiteZone(zone string) *csi.TopologyRequirement {
-	return &csi.TopologyRequirement{
-		Requisite: []*csi.Topology{
-			{Segments: map[string]string{driver.TopologyZoneKey: zone}},
-		},
-	}
-}
-
-// Accepts type and availability_zone; ignores csi.storage.k8s.io/*; rejects other keys.
 func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 	t.Parallel()
 
@@ -1059,12 +1082,8 @@ func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 			t.Parallel()
 
 			client := newMockEVSClient()
-			svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
-			if err != nil {
-				t.Fatalf("NewControllerService failed: %v", err)
-			}
-
-			_, err = svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{
+			svc := mustController(t, client)
+			_, err := svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{
 				Name:                      "parameter-vol",
 				VolumeCapabilities:        []*csi.VolumeCapability{mountCapability("")},
 				Parameters:                tt.parameters,
@@ -1072,7 +1091,7 @@ func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 			})
 			if status.Code(err) != tt.wantCode {
 				t.Fatalf(
-					"CreateVolume status = %v (%v), want %v",
+					"CreateVolume() status = %v (%v), want %v",
 					status.Code(err),
 					err,
 					tt.wantCode,
@@ -1080,21 +1099,20 @@ func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 			}
 			if tt.wantCode != codes.OK {
 				if len(client.volumes) != 0 {
-					t.Errorf("a rejected request created %d volumes, want 0", len(client.volumes))
+					t.Errorf("CreateVolume() volumes = %d, want 0", len(client.volumes))
 				}
 				return
 			}
-
 			if client.lastCreate.VolumeType != tt.wantType {
 				t.Errorf(
-					"EVS create volume type = %q, want %q",
+					"CreateVolume() EVS type = %q, want %q",
 					client.lastCreate.VolumeType,
 					tt.wantType,
 				)
 			}
 			if client.lastCreate.AvailabilityZone != tt.wantZone {
 				t.Errorf(
-					"EVS create zone = %q, want %q",
+					"CreateVolume() EVS zone = %q, want %q",
 					client.lastCreate.AvailabilityZone,
 					tt.wantZone,
 				)
@@ -1103,7 +1121,6 @@ func TestCreateVolume_AcceptsOnlyTheDeclaredParameters(t *testing.T) {
 	}
 }
 
-// CreateVolume must reject any VolumeContentSource.
 func TestCreateVolume_RejectsAVolumeContentSource(t *testing.T) {
 	t.Parallel()
 
@@ -1138,12 +1155,8 @@ func TestCreateVolume_RejectsAVolumeContentSource(t *testing.T) {
 			t.Parallel()
 
 			client := newMockEVSClient()
-			svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
-			if err != nil {
-				t.Fatalf("NewControllerService failed: %v", err)
-			}
-
-			_, err = svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{
+			svc := mustController(t, client)
+			_, err := svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{
 				Name:                      "cloned-vol",
 				VolumeCapabilities:        []*csi.VolumeCapability{mountCapability("")},
 				Parameters:                map[string]string{"type": "SSD"},
@@ -1152,19 +1165,18 @@ func TestCreateVolume_RejectsAVolumeContentSource(t *testing.T) {
 			})
 			if status.Code(err) != codes.InvalidArgument {
 				t.Fatalf(
-					"CreateVolume status = %v (%v), want InvalidArgument",
+					"CreateVolume() status = %v (%v), want InvalidArgument",
 					status.Code(err),
 					err,
 				)
 			}
 			if len(client.volumes) != 0 {
-				t.Errorf("a rejected request created %d volumes, want 0", len(client.volumes))
+				t.Errorf("CreateVolume() volumes = %d, want 0", len(client.volumes))
 			}
 		})
 	}
 }
 
-// Capacity: floor 10GiB, round up partial GiB, no artificial max.
 func TestCreateVolume_ResolvesRequestedCapacity(t *testing.T) {
 	t.Parallel()
 
@@ -1236,11 +1248,7 @@ func TestCreateVolume_ResolvesRequestedCapacity(t *testing.T) {
 			t.Parallel()
 
 			client := newMockEVSClient()
-			svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
-			if err != nil {
-				t.Fatalf("NewControllerService failed: %v", err)
-			}
-
+			svc := mustController(t, client)
 			resp, err := svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{
 				Name:                      "capacity-vol",
 				CapacityRange:             tt.capacity,
@@ -1249,31 +1257,32 @@ func TestCreateVolume_ResolvesRequestedCapacity(t *testing.T) {
 				AccessibilityRequirements: requisiteZone("eu-de-01"),
 			})
 			if err != nil {
-				t.Fatalf("CreateVolume failed: %v", err)
+				t.Fatalf("CreateVolume() = %v", err)
 			}
-
 			if client.lastCreate.Size != tt.wantSizeGiB {
 				t.Errorf(
-					"EVS create size = %d GiB, want %d GiB",
+					"CreateVolume() EVS size = %d GiB, want %d GiB",
 					client.lastCreate.Size,
 					tt.wantSizeGiB,
 				)
 			}
-			if want := int64(tt.wantSizeGiB) * gib; resp.GetVolume().GetCapacityBytes() != want {
+			wantBytes := int64(tt.wantSizeGiB) * gib
+			if resp.GetVolume().GetCapacityBytes() != wantBytes {
 				t.Errorf(
-					"reported capacity = %d bytes, want %d bytes",
+					"CreateVolume() CapacityBytes = %d, want %d",
 					resp.GetVolume().GetCapacityBytes(),
-					want,
+					wantBytes,
 				)
 			}
 		})
 	}
 }
 
-// Bad ranges -> InvalidArgument; no size in range -> OutOfRange.
 func TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity(t *testing.T) {
 	t.Parallel()
 
+	// A range that cannot be a request is InvalidArgument. A well-formed
+	// range that no whole-GiB size can meet is OutOfRange.
 	const gib = int64(1024 * 1024 * 1024)
 
 	tests := []struct {
@@ -1327,12 +1336,8 @@ func TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity(t *testing
 			t.Parallel()
 
 			client := newMockEVSClient()
-			svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
-			if err != nil {
-				t.Fatalf("NewControllerService failed: %v", err)
-			}
-
-			_, err = svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{
+			svc := mustController(t, client)
+			_, err := svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{
 				Name:                      "range-vol",
 				CapacityRange:             tt.capacity,
 				VolumeCapabilities:        []*csi.VolumeCapability{mountCapability("")},
@@ -1341,29 +1346,24 @@ func TestCreateVolume_DistinguishesMalformedFromUnsatisfiableCapacity(t *testing
 			})
 			if status.Code(err) != tt.wantCode {
 				t.Fatalf(
-					"CreateVolume status = %v (%v), want %v",
+					"CreateVolume() status = %v (%v), want %v",
 					status.Code(err),
 					err,
 					tt.wantCode,
 				)
 			}
 			if len(client.volumes) != 0 {
-				t.Errorf("a rejected request created %d volumes, want 0", len(client.volumes))
+				t.Errorf("CreateVolume() volumes = %d, want 0", len(client.volumes))
 			}
 		})
 	}
 }
 
-// Response volume context empty; no content source echoed.
 func TestCreateVolume_ReflectsNoParameterIntoTheResponse(t *testing.T) {
 	t.Parallel()
 
 	client := newMockEVSClient()
-	svc, err := driver.NewControllerService(client, validTestConfig(), discardLogger())
-	if err != nil {
-		t.Fatalf("NewControllerService failed: %v", err)
-	}
-
+	svc := mustController(t, client)
 	resp, err := svc.CreateVolume(t.Context(), &csi.CreateVolumeRequest{
 		Name:               "context-vol",
 		VolumeCapabilities: []*csi.VolumeCapability{mountCapability("")},
@@ -1374,14 +1374,16 @@ func TestCreateVolume_ReflectsNoParameterIntoTheResponse(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("CreateVolume failed: %v", err)
+		t.Fatalf("CreateVolume() = %v", err)
 	}
-
 	if volumeContext := resp.GetVolume().GetVolumeContext(); len(volumeContext) != 0 {
-		t.Errorf("volume context = %v, want empty", volumeContext)
+		t.Errorf("CreateVolume() VolumeContext = %v, want empty", volumeContext)
 	}
 	if resp.GetVolume().GetContentSource() != nil {
-		t.Errorf("content source = %v, want nil", resp.GetVolume().GetContentSource())
+		t.Errorf(
+			"CreateVolume() ContentSource = %v, want nil",
+			resp.GetVolume().GetContentSource(),
+		)
 	}
 }
 
@@ -1389,26 +1391,23 @@ func TestControllerService_GRPC_WireTransport(t *testing.T) {
 	t.Parallel()
 
 	evsMock := newMockEVSClient()
-	svc, err := driver.NewControllerService(evsMock, validTestConfig(), discardLogger())
-	if err != nil {
-		t.Fatalf("NewControllerService failed: %v", err)
-	}
-
+	svc := mustController(t, evsMock)
 	client := newControllerClient(t, svc)
 
-	// ControllerGetCapabilities over wire
 	capsResp, err := client.ControllerGetCapabilities(
 		t.Context(),
 		&csi.ControllerGetCapabilitiesRequest{},
 	)
 	if err != nil {
-		t.Fatalf("ControllerGetCapabilities over gRPC failed: %v", err)
+		t.Fatalf("ControllerGetCapabilities() = %v", err)
 	}
 	if len(capsResp.GetCapabilities()) != 2 {
-		t.Errorf("expected 2 capabilities over gRPC wire, got: %d", len(capsResp.GetCapabilities()))
+		t.Errorf(
+			"ControllerGetCapabilities() len = %d, want 2",
+			len(capsResp.GetCapabilities()),
+		)
 	}
 
-	// CreateVolume over wire
 	createReq := &csi.CreateVolumeRequest{
 		Name: "wire-volume",
 		CapacityRange: &csi.CapacityRange{
@@ -1426,19 +1425,20 @@ func TestControllerService_GRPC_WireTransport(t *testing.T) {
 			},
 		},
 	}
-
 	createResp, err := client.CreateVolume(t.Context(), createReq)
 	if err != nil {
-		t.Fatalf("CreateVolume over gRPC failed: %v", err)
+		t.Fatalf("CreateVolume() = %v", err)
 	}
 	if createResp.GetVolume().GetVolumeId() == "" {
-		t.Error("expected non-empty VolumeId over wire")
+		t.Error("CreateVolume() VolumeId is empty")
 	}
 	if createResp.GetVolume().GetCapacityBytes() != 10*1024*1024*1024 {
-		t.Errorf("expected capacity 10GiB, got %d", createResp.GetVolume().GetCapacityBytes())
+		t.Errorf(
+			"CreateVolume() CapacityBytes = %d, want 10GiB",
+			createResp.GetVolume().GetCapacityBytes(),
+		)
 	}
 
-	// ControllerPublishVolume over wire
 	pubResp, err := client.ControllerPublishVolume(
 		t.Context(),
 		&csi.ControllerPublishVolumeRequest{
@@ -1448,13 +1448,12 @@ func TestControllerService_GRPC_WireTransport(t *testing.T) {
 		},
 	)
 	if err != nil {
-		t.Fatalf("ControllerPublishVolume over gRPC failed: %v", err)
+		t.Fatalf("ControllerPublishVolume() = %v", err)
 	}
 	if pubResp == nil {
-		t.Error("expected non-nil response for ControllerPublishVolume over wire")
+		t.Error("ControllerPublishVolume() = nil, want response")
 	}
 
-	// ControllerUnpublishVolume over wire
 	_, err = client.ControllerUnpublishVolume(
 		t.Context(),
 		&csi.ControllerUnpublishVolumeRequest{
@@ -1463,23 +1462,21 @@ func TestControllerService_GRPC_WireTransport(t *testing.T) {
 		},
 	)
 	if err != nil {
-		t.Fatalf("ControllerUnpublishVolume over gRPC failed: %v", err)
+		t.Fatalf("ControllerUnpublishVolume() = %v", err)
 	}
 
-	// Idempotent CreateVolume over wire
 	createResp2, err := client.CreateVolume(t.Context(), createReq)
 	if err != nil {
-		t.Fatalf("idempotent CreateVolume over gRPC failed: %v", err)
+		t.Fatalf("CreateVolume() idempotent = %v", err)
 	}
 	if createResp2.GetVolume().GetVolumeId() != createResp.GetVolume().GetVolumeId() {
 		t.Errorf(
-			"expected identical volume ID over wire, got %s and %s",
-			createResp.GetVolume().GetVolumeId(),
+			"CreateVolume() VolumeId = %s, want %s",
 			createResp2.GetVolume().GetVolumeId(),
+			createResp.GetVolume().GetVolumeId(),
 		)
 	}
 
-	// ValidateVolumeCapabilities over wire
 	valResp, err := client.ValidateVolumeCapabilities(
 		t.Context(),
 		&csi.ValidateVolumeCapabilitiesRequest{
@@ -1488,26 +1485,24 @@ func TestControllerService_GRPC_WireTransport(t *testing.T) {
 		},
 	)
 	if err != nil {
-		t.Fatalf("ValidateVolumeCapabilities over gRPC failed: %v", err)
+		t.Fatalf("ValidateVolumeCapabilities() = %v", err)
 	}
 	if valResp.GetConfirmed() == nil {
-		t.Error("expected non-nil Confirmed over gRPC wire")
+		t.Error("ValidateVolumeCapabilities() Confirmed = nil, want set")
 	}
 
-	// DeleteVolume over wire
 	_, err = client.DeleteVolume(t.Context(), &csi.DeleteVolumeRequest{
 		VolumeId: createResp.GetVolume().GetVolumeId(),
 	})
 	if err != nil {
-		t.Fatalf("DeleteVolume over gRPC failed: %v", err)
+		t.Fatalf("DeleteVolume() = %v", err)
 	}
 
-	// Idempotent DeleteVolume over wire
 	_, err = client.DeleteVolume(t.Context(), &csi.DeleteVolumeRequest{
 		VolumeId: createResp.GetVolume().GetVolumeId(),
 	})
 	if err != nil {
-		t.Fatalf("idempotent DeleteVolume over gRPC failed: %v", err)
+		t.Fatalf("DeleteVolume() idempotent = %v", err)
 	}
 }
 
@@ -1517,21 +1512,24 @@ func TestControllerService_UnixDomainSocket_WireTransport(t *testing.T) {
 	sockPath := filepath.Join(t.TempDir(), "csi.sock")
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
-		t.Fatalf("failed to listen on unix domain socket %s: %v", sockPath, err)
+		t.Fatalf("Listen(unix, %s) = %v", sockPath, err)
 	}
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
 
 	evsMock := newMockEVSClient()
-	svc, err := driver.NewControllerService(evsMock, validTestConfig(), discardLogger())
-	if err != nil {
-		_ = ln.Close()
-		t.Fatalf("NewControllerService failed: %v", err)
-	}
+	svc := mustController(t, evsMock)
 
 	server := grpc.NewServer()
 	csi.RegisterControllerServer(server, svc)
+	t.Cleanup(server.GracefulStop)
 
 	go func() {
-		_ = server.Serve(ln)
+		serveErr := server.Serve(ln)
+		if serveErr != nil && serveErr != grpc.ErrServerStopped {
+			t.Errorf("Serve() = %v", serveErr)
+		}
 	}()
 
 	conn, err := grpc.NewClient(
@@ -1539,19 +1537,13 @@ func TestControllerService_UnixDomainSocket_WireTransport(t *testing.T) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
-		server.GracefulStop()
-		t.Fatalf("failed to dial unix domain socket %s: %v", sockPath, err)
+		t.Fatalf("NewClient(%s) = %v", sockPath, err)
 	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
 
 	client := csi.NewControllerClient(conn)
-
-	defer func() {
-		_ = conn.Close()
-		server.GracefulStop()
-		_ = ln.Close()
-	}()
-
-	// Perform gRPC volume creation, publish, unpublish, and deletion over Unix domain socket
 	createResp, err := client.CreateVolume(t.Context(), &csi.CreateVolumeRequest{
 		Name: "uds-volume",
 		VolumeCapabilities: []*csi.VolumeCapability{
@@ -1567,10 +1559,10 @@ func TestControllerService_UnixDomainSocket_WireTransport(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("CreateVolume over UDS failed: %v", err)
+		t.Fatalf("CreateVolume() = %v", err)
 	}
 	if createResp.GetVolume().GetVolumeId() == "" {
-		t.Fatal("expected non-empty VolumeId over UDS")
+		t.Fatal("CreateVolume() VolumeId is empty")
 	}
 
 	_, err = client.ControllerPublishVolume(
@@ -1584,7 +1576,7 @@ func TestControllerService_UnixDomainSocket_WireTransport(t *testing.T) {
 		},
 	)
 	if err != nil {
-		t.Fatalf("ControllerPublishVolume over UDS failed: %v", err)
+		t.Fatalf("ControllerPublishVolume() = %v", err)
 	}
 
 	_, err = client.ControllerUnpublishVolume(
@@ -1595,13 +1587,13 @@ func TestControllerService_UnixDomainSocket_WireTransport(t *testing.T) {
 		},
 	)
 	if err != nil {
-		t.Fatalf("ControllerUnpublishVolume over UDS failed: %v", err)
+		t.Fatalf("ControllerUnpublishVolume() = %v", err)
 	}
 
 	_, err = client.DeleteVolume(t.Context(), &csi.DeleteVolumeRequest{
 		VolumeId: createResp.GetVolume().GetVolumeId(),
 	})
 	if err != nil {
-		t.Fatalf("DeleteVolume over UDS failed: %v", err)
+		t.Fatalf("DeleteVolume() = %v", err)
 	}
 }
