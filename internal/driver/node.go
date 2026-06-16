@@ -168,14 +168,9 @@ func (s *NodeService) NodeStageVolume(
 			mountOptions,
 		)
 		if err != nil {
-			return nil, status.Error(
-				codes.Internal,
-				fmt.Sprintf(
-					"failed to format and mount device %s at %s: %v",
-					sourceDevice,
-					stagingPath,
-					err,
-				),
+			return nil, nodeHostError(
+				fmt.Sprintf("format and mount device %s at %s", sourceDevice, stagingPath),
+				err,
 			)
 		}
 		return &csi.NodeStageVolumeResponse{}, nil
@@ -203,14 +198,9 @@ func (s *NodeService) NodeUnstageVolume(
 	stagingPath := req.GetStagingTargetPath()
 
 	if err := s.mounter.Unmount(ctx, stagingPath); err != nil {
-		return nil, status.Error(
-			codes.Internal,
-			fmt.Sprintf(
-				"failed to unstage volume %q at %s: %v",
-				req.GetVolumeId(),
-				stagingPath,
-				err,
-			),
+		return nil, nodeHostError(
+			fmt.Sprintf("unstage volume %q at %s", req.GetVolumeId(), stagingPath),
+			err,
 		)
 	}
 
@@ -277,14 +267,9 @@ func (s *NodeService) NodePublishVolume(
 		}
 
 		if err := s.mounter.Mount(ctx, sourceDevice, targetPath, "", mountOptions); err != nil {
-			return nil, status.Error(
-				codes.Internal,
-				fmt.Sprintf(
-					"failed to bind mount raw block device %s to %s: %v",
-					sourceDevice,
-					targetPath,
-					err,
-				),
+			return nil, nodeHostError(
+				fmt.Sprintf("bind mount raw block device %s to %s", sourceDevice, targetPath),
+				err,
 			)
 		}
 		return &csi.NodePublishVolumeResponse{}, nil
@@ -292,9 +277,9 @@ func (s *NodeService) NodePublishVolume(
 	case *csi.VolumeCapability_Mount:
 		staged, err := s.mounter.IsMountPoint(ctx, stagingPath)
 		if err != nil {
-			return nil, status.Error(
-				codes.Internal,
-				fmt.Sprintf("failed to check staging path %s: %v", stagingPath, err),
+			return nil, nodeHostError(
+				fmt.Sprintf("check staging path %s", stagingPath),
+				err,
 			)
 		}
 		if !staged {
@@ -322,14 +307,9 @@ func (s *NodeService) NodePublishVolume(
 		}
 
 		if err := s.mounter.Mount(ctx, stagingPath, targetPath, "", mountOptions); err != nil {
-			return nil, status.Error(
-				codes.Internal,
-				fmt.Sprintf(
-					"failed to bind mount staging path %s at target %s: %v",
-					stagingPath,
-					targetPath,
-					err,
-				),
+			return nil, nodeHostError(
+				fmt.Sprintf("bind mount staging path %s at target %s", stagingPath, targetPath),
+				err,
 			)
 		}
 		return &csi.NodePublishVolumeResponse{}, nil
@@ -357,14 +337,9 @@ func (s *NodeService) NodeUnpublishVolume(
 	targetPath := req.GetTargetPath()
 
 	if err := s.mounter.Unmount(ctx, targetPath); err != nil {
-		return nil, status.Error(
-			codes.Internal,
-			fmt.Sprintf(
-				"failed to unpublish volume %q at target %s: %v",
-				req.GetVolumeId(),
-				targetPath,
-				err,
-			),
+		return nil, nodeHostError(
+			fmt.Sprintf("unpublish volume %q at target %s", req.GetVolumeId(), targetPath),
+			err,
 		)
 	}
 
@@ -394,9 +369,19 @@ func (s *NodeService) discoverDevice(
 		return device, nil
 	}
 
-	// Map mounter identity errors to gRPC codes.
+	// Map mounter identity and context errors to gRPC codes.
 	code := codes.NotFound
 	switch {
+	case errors.Is(err, context.Canceled):
+		return "", status.Error(
+			codes.Canceled,
+			fmt.Sprintf("failed to verify the block device for volume %q: %v", volumeID, err),
+		)
+	case errors.Is(err, context.DeadlineExceeded):
+		return "", status.Error(
+			codes.DeadlineExceeded,
+			fmt.Sprintf("failed to verify the block device for volume %q: %v", volumeID, err),
+		)
 	case errors.Is(err, mount.ErrInvalidInput):
 		code = codes.InvalidArgument
 	case errors.Is(err, mount.ErrDeviceIdentityUnverified):
@@ -407,6 +392,21 @@ func (s *NodeService) discoverDevice(
 		code,
 		fmt.Sprintf("failed to verify the block device for volume %q: %v", volumeID, err),
 	)
+}
+
+// nodeHostError maps host and context errors to canonical gRPC status codes.
+func nodeHostError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return status.Error(codes.Canceled, fmt.Sprintf("%s: %v", op, err))
+	case errors.Is(err, context.DeadlineExceeded):
+		return status.Error(codes.DeadlineExceeded, fmt.Sprintf("%s: %v", op, err))
+	default:
+		return status.Error(codes.Internal, fmt.Sprintf("failed to %s: %v", op, err))
+	}
 }
 
 // createBlockTargetFile creates the placeholder file that a raw block device is bind
