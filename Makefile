@@ -2,8 +2,11 @@
 V ?= 0
 Q := $(if $(filter 1,$(V)),,@)
 
+# Tool entry points
 GO ?= go
 GOFMT ?= gofmt
+CONTAINER_TOOL ?= docker
+CONTAINERFILE ?= Containerfile
 
 # Local outputs
 BIN_DIR ?= bin
@@ -11,44 +14,49 @@ DIST_DIR ?= dist
 BINARY ?= t-cloud-csi-driver
 CMD_PKG ?= ./cmd/t-cloud-csi-driver
 
-# Build identity. An -X symbol path that matches nothing links cleanly and stamps nothing, so the
-# package path comes from go.mod.
+# MODULE is whatever go.mod records.
 MODULE := $(shell $(GO) list -m)
 VERSION_PKG := $(MODULE)/internal/version
 
-# A build that cannot see the repository reports dev, like an unstamped binary.
+# Outside a readable git tree describe is empty and VERSION becomes dev. GIT_COMMIT becomes
+# unknown in the same situation.
 GIT_DESCRIBE := $(shell git describe --tags --dirty 2>/dev/null)
 VERSION ?= $(if $(GIT_DESCRIBE),$(GIT_DESCRIBE),dev)
 GIT_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 
-# Taken from the HEAD committer date, so one commit always builds to the same bytes. The date -d
-# and date -r pair covers GNU and BSD.
+# SOURCE_DATE_EPOCH is the HEAD committer unix time so one commit always stamps the same
+# BUILD_DATE.
 SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || date -u +%s)
 BUILD_DATE ?= $(shell date -u -d @$(SOURCE_DATE_EPOCH) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
                    || date -u -r $(SOURCE_DATE_EPOCH) +%Y-%m-%dT%H:%M:%SZ)
 
-# -s -w drops the symbol table and DWARF; function names stay in the pclntab, so panic tracebacks
-# survive.
+# -s -w strip debug info.
 GO_LDFLAGS := -s -w \
 	-X '$(VERSION_PKG).version=$(VERSION)' \
 	-X '$(VERSION_PKG).commit=$(GIT_COMMIT)' \
 	-X '$(VERSION_PKG).buildDate=$(BUILD_DATE)'
 
-# Container image. IMAGE_REPO names the registry path to push to and has no default; unset,
-# the image only gets a local name. IMAGE_SOURCE names the repository the image was built from and
-# has no default either, because this tree can be checked out from a mirror. Image tags cannot
-# carry the semver build separator, so + becomes _.
-CONTAINER_TOOL ?= docker
-CONTAINERFILE ?= Containerfile
+# IMAGE_REPO is the registry path used on push. Unset, the image is tagged locally under BINARY.
+# IMAGE_SOURCE is the repository the image was built from; unset, the OCI source label stays empty.
 IMAGE_REPO ?=
 IMAGE_SOURCE ?=
 IMAGE_TAG ?= $(subst +,_,$(VERSION))
 IMAGE := $(if $(IMAGE_REPO),$(IMAGE_REPO),$(BINARY)):$(IMAGE_TAG)
 
-# Committing changes VERSION and GIT_COMMIT without touching a source file, so the binary also
-# depends on a record of the identity it was stamped with.
+# A new commit changes VERSION and GIT_COMMIT without touching a Go file. Storing the stamped
+# identity beside the binary forces a relink when that identity changes and leaves the binary
+# alone when it has not.
 BUILD_ID := $(VERSION) $(GIT_COMMIT) $(BUILD_DATE)
 BUILD_ID_FILE := $(BIN_DIR)/.build-id
+
+# Live-proof sources
+E2E_TAG ?= e2e
+E2E_PKG ?= ./test/e2e
+E2E_DIST ?= $(DIST_DIR)/conformance
+E2E_BINARY ?= t-cloud-csi-conformance
+E2E_PROFILE ?= proof
+E2E_GOOS ?= linux
+E2E_GOARCH ?= amd64
 
 # Go formatting settings
 GOIMPORTS_FLAGS ?= -local git.wilaris.dev/t-cloud-public-csi-driver
@@ -58,29 +66,29 @@ GO_SOURCES := $(shell find . -name '*.go' \
 	-not -path './$(BIN_DIR)/*' \
 	-not -path './$(DIST_DIR)/*')
 
-# The binary itself is a file target, so a repeat build with no source change does nothing.
-.PHONY: build clean fmt fmt-check force image image-push image-smoke lint smoke test vet verify
+.PHONY: build clean e2e e2e-build e2e-compile e2e-list fmt fmt-check force image image-push \
+	image-smoke lint smoke test vet verify
 
+# Default goal: link the stamped driver under BIN_DIR.
 build: $(BIN_DIR)/$(BINARY)
 
 $(BIN_DIR)/$(BINARY): $(GO_SOURCES) go.mod go.sum $(BUILD_ID_FILE)
 	$(Q)mkdir -p $(BIN_DIR)
 	$(Q)CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(GO_LDFLAGS)" -o $@ $(CMD_PKG)
 
-# Rewritten only when the identity actually changes, so the binary is relinked on a new commit and
-# left alone otherwise.
+# force is never a file, so this recipe always runs.
 $(BUILD_ID_FILE): force
 	$(Q)mkdir -p $(BIN_DIR)
 	$(Q)printf '%s\n' '$(BUILD_ID)' | cmp -s - $@ || printf '%s\n' '$(BUILD_ID)' > $@
 
-# Never exists as a file, so targets depending on it always run their recipe.
 force:
 
+# Delete local build and distribution trees.
 clean:
 	$(Q)rm -rf $(BIN_DIR) $(DIST_DIR)
 
-# Fails when an -X symbol path stops matching, which the linker itself will not report.
-# LOG_LEVEL silences the startup record so only the version line reaches stdout.
+# Run the built binary and require that --version contain the VERSION this file asked the linker
+# to stamp.
 smoke: build
 	$(Q)out="$$( LOG_LEVEL=error $(BIN_DIR)/$(BINARY) --version )" || exit 1; \
 	case "$$out" in \
@@ -88,7 +96,31 @@ smoke: build
 		*) echo "--version did not report $(VERSION): $$out" >&2; exit 1;; \
 	esac
 
-# The image targets need a container daemon, so none of them is part of verify.
+# Link the live-proof package into a standalone binary and copy the stamped driver beside it.
+e2e-build: build
+	$(Q)mkdir -p $(E2E_DIST)
+	$(Q)CGO_ENABLED=0 GOOS=$(E2E_GOOS) GOARCH=$(E2E_GOARCH) \
+		$(GO) test -c -tags $(E2E_TAG) -trimpath -ldflags "$(GO_LDFLAGS)" \
+		-o $(E2E_DIST)/$(E2E_BINARY) $(E2E_PKG)
+	$(Q)cp $(BIN_DIR)/$(BINARY) $(E2E_DIST)/$(BINARY)
+
+# Execute the asset under one declared profile. Creates, attaches, formats, mounts and deletes
+# real volumes. Outside verify; requires explicit authorization on an approved instance.
+e2e: e2e-build
+	$(Q)cd $(E2E_DIST) && ./$(E2E_BINARY) -profile=$(E2E_PROFILE) -driver-binary=./$(BINARY)
+
+# Compile-only check of the tagged sources; output goes to /dev/null. Catches e2e build breakage
+# before a live run does.
+e2e-compile:
+	$(Q)CGO_ENABLED=0 GOOS=$(E2E_GOOS) GOARCH=$(E2E_GOARCH) \
+		$(GO) test -c -tags $(E2E_TAG) -o /dev/null $(E2E_PKG)
+
+# Print the clause catalogue. Runs offline, so it shows what a run would check before one is
+# approved.
+e2e-list: e2e-build
+	$(Q)cd $(E2E_DIST) && ./$(E2E_BINARY) -list-checks
+
+# Needs a container daemon. The image targets stay out of verify.
 image:
 	$(Q)$(CONTAINER_TOOL) build -f $(CONTAINERFILE) \
 		--build-arg VERSION='$(VERSION)' \
@@ -97,7 +129,7 @@ image:
 		--build-arg IMAGE_SOURCE='$(IMAGE_SOURCE)' \
 		-t $(IMAGE) .
 
-# Runs --version inside the image, so a stamping mistake in the Containerfile fails here.
+# Run --version inside the image to catch Containerfile stamping mistakes before a push.
 image-smoke: image
 	$(Q)out="$$( $(CONTAINER_TOOL) run --rm -e LOG_LEVEL=error $(IMAGE) --version )" || exit 1; \
 	case "$$out" in \
@@ -105,7 +137,7 @@ image-smoke: image
 		*) echo "image --version did not report $(VERSION): $$out" >&2; exit 1;; \
 	esac
 
-# Pushing publishes the image outside this machine.
+# Pushes to a registry. IMAGE_REPO must name the registry path.
 image-push: image
 	$(Q)test -n "$(IMAGE_REPO)" || { \
 		echo "set IMAGE_REPO to the registry path to push to," \
@@ -114,32 +146,28 @@ image-push: image
 	}
 	$(Q)$(CONTAINER_TOOL) push $(IMAGE)
 
+# Rewrite imports and wrap long lines in place when sources exist.
 fmt:
 	$(Q)if [ -n "$(GO_SOURCES)" ]; then \
 		$(GO) tool goimports $(GOIMPORTS_FLAGS) -w $(GO_SOURCES); \
 		$(GO) tool golines $(GOLINES_FLAGS) -w $(GO_SOURCES); \
 	fi
 
+# Fail when gofmt, goimports or golines would rewrite a file.
 fmt-check:
 	$(Q)if [ -n "$(GO_SOURCES)" ]; then \
-		unformatted=$$( $(GOFMT) -l $(GO_SOURCES) ); \
-		if [ -n "$$unformatted" ]; then \
-			echo "gofmt: these files need formatting (run 'make fmt'):" >&2; \
-			echo "$$unformatted" >&2; \
-			exit 1; \
-		fi; \
-		unformatted=$$( $(GO) tool goimports $(GOIMPORTS_FLAGS) -l $(GO_SOURCES) ); \
-		if [ -n "$$unformatted" ]; then \
-			echo "goimports: these files need formatting (run 'make fmt'):" >&2; \
-			echo "$$unformatted" >&2; \
-			exit 1; \
-		fi; \
-		unformatted=$$( $(GO) tool golines $(GOLINES_FLAGS) -l $(GO_SOURCES) ); \
-		if [ -n "$$unformatted" ]; then \
-			echo "golines: these files need formatting (run 'make fmt'):" >&2; \
-			echo "$$unformatted" >&2; \
-			exit 1; \
-		fi; \
+		for spec in \
+			"gofmt $(GOFMT)" \
+			"goimports $(GO) tool goimports $(GOIMPORTS_FLAGS)" \
+			"golines $(GO) tool golines $(GOLINES_FLAGS)" \
+		; do \
+			unformatted=$$( $${spec#* } -l $(GO_SOURCES) ); \
+			if [ -n "$$unformatted" ]; then \
+				echo "$${spec%% *}: these files need formatting (run 'make fmt'):" >&2; \
+				echo "$$unformatted" >&2; \
+				exit 1; \
+			fi; \
+		done; \
 	fi
 
 lint: fmt-check vet
@@ -148,6 +176,7 @@ lint: fmt-check vet
 		$(GO) tool golangci-lint run ./...; \
 	fi
 
+# Always silenced with @, not Q, so V=1 does not echo these.
 test:
 	@packages="$$( $(GO) list ./... )" || exit 1; \
 	if [ -z "$$packages" ]; then printf '%s\n' 'no Go packages to test'; exit 0; fi; \
@@ -158,4 +187,6 @@ vet:
 	if [ -z "$$packages" ]; then printf '%s\n' 'no Go packages to vet'; exit 0; fi; \
 	$(GO) vet ./...
 
-verify: fmt-check vet test build smoke
+# Offline gate: format, static analysis, tests, stamped binary, identity check and a compile of the
+# tagged proof sources. Does not build or run the image and does not reach the cloud.
+verify: fmt-check vet test build smoke e2e-compile
