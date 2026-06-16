@@ -51,7 +51,7 @@ type Config struct {
 func NewProviderClient(ctx context.Context, cfg Config) (*golangsdk.ProviderClient, error) {
 	if cfg.AuthURL == "" || cfg.AccessKey == "" || cfg.SecretKey == "" || cfg.ProjectID == "" ||
 		cfg.RegionName == "" {
-		return nil, fmt.Errorf("invalid configuration: required fields missing")
+		return nil, errors.New("invalid configuration: required fields missing")
 	}
 
 	opts := golangsdk.AKSKAuthOptions{
@@ -65,7 +65,7 @@ func NewProviderClient(ctx context.Context, cfg Config) (*golangsdk.ProviderClie
 	client, err := openstack.NewClient(cfg.AuthURL)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"failed to create provider client: %w",
+			"create provider client: %w",
 			sanitizeError(err, cfg),
 		)
 	}
@@ -86,7 +86,7 @@ func NewProviderClient(ctx context.Context, cfg Config) (*golangsdk.ProviderClie
 
 	if err := openstack.Authenticate(client, opts); err != nil {
 		return nil, fmt.Errorf(
-			"failed to authenticate provider client: %w",
+			"authenticate provider client: %w",
 			sanitizeError(err, cfg),
 		)
 	}

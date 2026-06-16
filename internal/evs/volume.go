@@ -86,7 +86,7 @@ type DiscoverVolumeOpts struct {
 	MaxSizeGiB       int    `json:"max_size_gib,omitempty"`
 }
 
-// Client is the EVS volume and attachment client.
+// Client is the EVS volume and attachment client. Construct with NewClient or NewClientFromProvider.
 type Client struct {
 	cfg       Config
 	v3Client  *golangsdk.ServiceClient
@@ -110,7 +110,7 @@ func NewClientFromProvider(provider *golangsdk.ProviderClient, cfg Config) (*Cli
 	})
 	if err != nil {
 		return nil, fmt.Errorf(
-			"failed to create block storage v3 service client: %w",
+			"create block storage v3 service client: %w",
 			sanitizeError(err, cfg),
 		)
 	}
@@ -120,7 +120,7 @@ func NewClientFromProvider(provider *golangsdk.ProviderClient, cfg Config) (*Cli
 	})
 	if err != nil {
 		return nil, fmt.Errorf(
-			"failed to create block storage v2 service client: %w",
+			"create block storage v2 service client: %w",
 			sanitizeError(err, cfg),
 		)
 	}
@@ -130,7 +130,7 @@ func NewClientFromProvider(provider *golangsdk.ProviderClient, cfg Config) (*Cli
 	})
 	if err != nil {
 		return nil, fmt.Errorf(
-			"failed to create ECS v1 service client: %w",
+			"create ECS v1 service client: %w",
 			sanitizeError(err, cfg),
 		)
 	}
@@ -476,7 +476,7 @@ func (c *Client) waitForJobSuccess(ctx context.Context, jobID string) (string, e
 		default:
 		}
 
-		job := new(v3volumes.JobStatus)
+		var job v3volumes.JobStatus
 		//nolint:bodyclose // the SDK closes the body after decoding into job
 		_, err = jobClient.Get(jobClient.ServiceURL("jobs", jobID), &job, nil)
 		if err == nil {
