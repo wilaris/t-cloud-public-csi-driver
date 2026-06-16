@@ -8,7 +8,7 @@ Read this page before you run it. A run mutates real cloud state and costs real 
 ## What a run does to your project
 
 - It creates, attaches, formats, mounts, reads, unmounts, detaches and deletes real volumes.
-- It deliberately creates a few volumes the driver does not own, to confirm the driver refuses to adopt
+- It creates a few volumes the driver does not own, to confirm the driver will not adopt
   or delete them.
 - Everything it creates carries a run-unique `csi-e2e-<run id>-` name prefix. It writes each
   intended resource to a local ledger *before* asking the cloud for it, so an interrupted run is still
@@ -21,7 +21,7 @@ Read this page before you run it. A run mutates real cloud state and costs real 
 ## What you need
 
 - A T Cloud Public project you are willing to have mutated. Use a throwaway project, not one holding
-  anything else. Nothing in the run can tell the difference, so the assertion is yours to make.
+  anything else. The run has no way to check that.
 - One compute instance in that project, which you destroy afterwards. Credentials reach the instance for
   the run and are not meant to outlive it.
 - Root on that instance. The node checks attach, format and mount real block devices.
@@ -70,7 +70,7 @@ itself is required as a flag and has no environment alternative.
 
 | Flag | Variable | Purpose |
 |---|---|---|
-| `-profile` | | Required. `evaluation` selects every attachment-handoff, volume-lifecycle and role-startup check. `proof` selects all 29 catalogue entries. |
+| `-profile` | | Required. `evaluation` selects every attachment-handoff, volume-lifecycle and role-startup check. `proof` selects all 29 catalog entries. |
 | `-approved-project-id` | `CSI_E2E_APPROVED_PROJECT_ID` | Required. Your assertion that this project may be mutated. Must equal `OS_PROJECT_ID`. |
 | `-volume-type` | `CSI_E2E_VOLUME_TYPE` | Required. The volume type every fixture provisions. |
 | `-driver-binary` | `CSI_E2E_DRIVER_BINARY` | The driver binary to drive. Defaults to `./t-cloud-csi-driver`. |
@@ -85,15 +85,19 @@ itself is required as a flag and has no environment alternative.
 
 Credentials are read from the process environment only:
 
-| Variable | Required |
-|---|---|
-| `OS_AUTH_URL`, `OS_ACCESS_KEY`, `OS_SECRET_KEY`, `OS_PROJECT_ID`, `OS_REGION_NAME` | yes |
-| `OS_SECURITY_TOKEN` | no, for temporary credentials |
+| Variable | Required | Purpose |
+|---|---|---|
+| `OS_AUTH_URL` | yes | Identity / authentication service endpoint URL |
+| `OS_ACCESS_KEY` | yes | Access key ID for API authentication |
+| `OS_SECRET_KEY` | yes | Secret access key for API authentication |
+| `OS_PROJECT_ID` | yes | Target cloud project ID |
+| `OS_REGION_NAME` | yes | Cloud region name |
+| `OS_SECURITY_TOKEN` | no | Security token for temporary credentials |
 
-No credential is accepted as a flag. A run refuses to start if one appears on its own command line. It
-fails if one turns up in anything it wrote.
+No credential is accepted as a flag. The run exits before creating anything if a credential appears on
+its command line. It fails if one turns up in anything it wrote.
 
-The binary refuses test-framework selection, skipping, repetition, shuffling, fail-fast and timeout
+The binary rejects test-framework selection, skipping, repetition, shuffling, fail-fast and timeout
 controls. Do not pass non-default `-test.run`, `-test.skip`, `-test.count`, `-test.shuffle`,
 `-test.failfast` or `-test.timeout`; selection belongs to `-profile`. Repetition or premature exit
 could duplicate effects or bypass reclamation. Use `-time-budget` for the run's own bound.
@@ -107,15 +111,15 @@ Every check ends in one of three outcomes:
 - **not reached**: the check did not run, with a reason that tells you whether it could have. `cost not
   authorized` means a setting would enable it. `timing window missed` and `instance shape` mean the
   service or the instance did not offer the condition this time. A second run may differ. `not
-  forceable here` means neither the service nor any caller can produce that state on demand, so no run of
-  this binary will ever demonstrate it. `blocked by an earlier failure` and `time budget exhausted` mean
-  the run stopped short. `never executed` and `unclassified skip` point at a defect in this asset rather
-  than at the driver. The report says so.
+  forceable here` means neither the service nor any caller can produce that state on demand. This binary
+  cannot demonstrate it. `blocked by an earlier failure` and `time budget exhausted` mean
+  the run stopped short. `never executed` and `unclassified skip` mean this asset is defective, not
+  the driver. The report labels them that way.
 
-A check that never ran is reported as not reached rather than omitted, so the counts always add up to
-the selected list and a passing summary cannot hide a gap. A never-executed check, an unclassified skip,
-catalogue incoherence or incomplete required output cannot return exit 0, regardless of strict mode.
-Every not-forceable entry names the offline transport route that proves it in the catalogue, report and
+A check that never ran is listed as not reached, so the counts always add up to
+the selected list and a passing summary still shows every gap. A never-executed check, an unclassified skip,
+catalog incoherence or incomplete required output exits non-zero even when strict mode is off.
+Every not-forceable entry names the offline transport route that proves it in the catalog, report and
 evidence record.
 
 Exit codes:
@@ -123,16 +127,16 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | Every check this run could force was demonstrated. |
-| 1 | A check failed, a resource survived reclamation, the catalogue was incoherent or required output was incomplete. |
-| 2 | Refused before anything was created, usually a setting or a missing credential. |
+| 1 | A check failed, a resource survived reclamation, the catalog was incoherent or required output was incomplete. |
+| 2 | Exits before creating anything, usually a setting or a missing credential. |
 | 3 | Nothing failed, but the run did not cover everything it selected. |
 
-## What a passing run does not tell you
+## Limits of a passing run
 
-The report restates this. It matters for what you conclude:
+The report restates these limits:
 
-- It used the instance's own kernel, udev and filesystem utilities, not the versions inside the image a
-  release ships. The report names the versions it used.
+- It used the instance's own kernel, udev and filesystem utilities. Those may differ from the versions
+  inside the image a release ships. The report names the versions it used.
 - It covered one availability zone, one volume type and one instance shape.
 - It drove the driver's own service surface directly. No orchestrator, node agent or sidecar took part,
   so it says nothing about scheduling, claim-driven provisioning or restart recovery.
@@ -143,7 +147,7 @@ The report restates this. It matters for what you conclude:
 
 Keep the report and the machine-readable record. The record carries the run identifier, the server-issued
 identifiers the checks asserted against, the observed device paths and link names and the guest tool
-versions, which is what makes a disagreement about what the service answered settleable. Both are written
-through the driver's own redaction and through the run's own exact-value masking of the credentials it
-holds, checked in full before either destination is opened and required to finish successfully. The
-report and evidence paths must be distinct, so neither artifact can overwrite or mix with the other.
+versions. That is enough to settle a disagreement about what the service returned. Both are written
+with the driver's redaction and the run's exact-value masking of the credentials it holds.
+Redaction and masking run in full before either destination is opened. Both writes must succeed. The
+report and evidence paths must be distinct so the two artifacts do not overwrite or mix.
