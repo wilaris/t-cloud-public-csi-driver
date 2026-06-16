@@ -11,10 +11,6 @@ import (
 )
 
 // levelForCode maps a served RPC's status code to a log level.
-//
-// Success is Debug: sidecars and kubelet already log happy paths, and Probe traffic would
-// dominate. Retryable CSI codes (e.g. volume still attached elsewhere) are Warn so real
-// failures stay visible at Error.
 func levelForCode(code codes.Code) slog.Level {
 	switch code {
 	case codes.OK:
@@ -32,10 +28,6 @@ func levelForCode(code codes.Code) slog.Level {
 }
 
 // unaryLoggingInterceptor logs one line per served RPC.
-//
-// Only method, duration and status code are logged. The request is never read: volume
-// names, target paths and publish context are caller-controlled. On failure the returned
-// error is logged after the handler's own sanitization; the logger also redacts credentials.
 func unaryLoggingInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 	return func(
 		ctx context.Context,

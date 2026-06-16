@@ -31,7 +31,6 @@ const socketDirPerm = 0o750
 func main() {
 	logger := log.NewLoggerFromEnv(os.Stdout)
 
-	// Recorded before configuration so a failed start still names the build that failed.
 	info := version.Get()
 	logger.Info(
 		"Starting CSI driver",
@@ -43,7 +42,6 @@ func main() {
 	)
 
 	err := run(logger)
-	// Help and version requests already printed their output; neither is a startup failure.
 	if errors.Is(err, flag.ErrHelp) || errors.Is(err, config.ErrVersionRequested) {
 		return
 	}
@@ -53,8 +51,8 @@ func main() {
 	}
 }
 
-// run builds the selected role and serves until SIGINT/SIGTERM.
-// Config and dependencies are resolved before listen so a failed start leaves no socket.
+// run builds the selected role and serves until SIGINT/SIGTERM. Config and
+// dependencies are resolved before listen so a failed start leaves no socket.
 func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -107,8 +105,9 @@ func registerServices(
 	}
 }
 
-// registerController builds the controller path. EVS client construction authenticates, so bad
-// credentials fail at startup and a signal during that exchange stops it.
+// registerController builds the controller path. EVS client construction
+// authenticates, so bad credentials fail at startup and a signal during that
+// exchange stops it.
 func registerController(
 	ctx context.Context,
 	server *grpc.Server,
@@ -147,8 +146,7 @@ func registerNode(server *grpc.Server, cfg *config.Config, logger *slog.Logger) 
 	return nil
 }
 
-// listen opens the configured endpoint. For a unix socket it creates the parent directory and
-// removes a stale socket left by a previous process.
+// listen opens the configured endpoint.
 func listen(cfg *config.Config) (net.Listener, error) {
 	network, address, err := cfg.Network()
 	if err != nil {
@@ -181,7 +179,6 @@ func listen(cfg *config.Config) (net.Listener, error) {
 }
 
 // clearStaleSocket removes a leftover unix endpoint socket.
-// Non-socket paths are left alone so a bad endpoint cannot delete an unrelated file.
 func clearStaleSocket(socketPath string) error {
 	//nolint:gosec // endpoint path constrained at configuration ingress
 	info, err := os.Stat(socketPath)
@@ -204,8 +201,8 @@ func clearStaleSocket(socketPath string) error {
 	return nil
 }
 
-// serve runs the gRPC server until it fails or the process is signaled, then GracefulStop
-// so in-flight RPCs can finish.
+// serve runs the gRPC server until it fails or the process is signaled, then
+// GracefulStop so in-flight RPCs can finish.
 func serve(ctx context.Context, server *grpc.Server, listener net.Listener) error {
 	served := make(chan error, 1)
 	go func() {
