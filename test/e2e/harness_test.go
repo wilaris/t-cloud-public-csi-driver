@@ -47,7 +47,7 @@ type harness struct {
 	runDir string
 
 	// runCtx is the run's wall-clock bound.
-        // Teardown uses a separate budget so an expired run can still delete what it created.
+	// Teardown uses a separate budget so an expired run can still delete what it created.
 	runCtx context.Context
 
 	ledger      *ledger

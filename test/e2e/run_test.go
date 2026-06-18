@@ -39,7 +39,7 @@ type environment struct {
 	settings *settings.Settings
 
 	// Scenarios read these fields directly.
-        // They are copied from settings so call sites do not go through set each time.
+	// They are copied from settings so call sites do not go through set each time.
 	volumeType    string
 	driverBinary  string
 	pagingVolumes int
