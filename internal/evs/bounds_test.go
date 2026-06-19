@@ -257,6 +257,26 @@ func TestEveryPollingLoopTerminates(t *testing.T) {
 			},
 		},
 		{
+			name: "refused detach reconciliation",
+			script: []scriptedAnswer{
+				{body: attachmentsBody(stubDeviceName)},
+				{status: http.StatusBadRequest, body: refusedDetachBody},
+				{body: volumeDetailBody("detaching")},
+				// Detached state never arrives, so compute attachment listing keeps reporting attached.
+				{body: attachmentsBody(stubDeviceName)},
+			},
+			invoke: func(ctx context.Context, client *evs.Client) error {
+				return client.DetachVolume(ctx, stubVolumeID, stubServerID)
+			},
+			wantErr: context.DeadlineExceeded,
+			wantRequests: []string{
+				"GET /block_device",
+				"DELETE /detachvolume/" + stubVolumeID,
+				"GET /os-vendor-volumes/" + stubVolumeID,
+				"GET /block_device",
+			},
+		},
+		{
 			name: "deletion absence wait",
 			script: []scriptedAnswer{
 				{body: volumeDetailBody("available")},

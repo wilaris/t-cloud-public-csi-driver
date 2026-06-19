@@ -99,6 +99,11 @@ func TestCancelDuringReconcileReportsCanceled(t *testing.T) {
 const refusedAttachBody = `{"error":{"message":"the volume has already been attached to this instance` +
 	` and you cannot repeatedly attach.","code":"Ecs.0005","details":[{"code":"Ecs.0057"}]}}`
 
+// refusedDetachBody is the compute 400 returned when a detach is requested for a volume that is
+// still transitioning or attached.
+const refusedDetachBody = `{"error":{"message":"the volume cannot be detached in its current state",` +
+	`"code":"Ecs.0005","details":[{"code":"Ecs.0129"}]}}`
+
 // A canceled attach can leave compute holding an attachment the listing does not show yet.
 // Re-issuing is refused; the caller must get the established attachment, not the refusal.
 func TestRefusedAttachReconcilesAnAcceptedAttachment(t *testing.T) {
@@ -281,6 +286,227 @@ func TestTerminalAttachRefusalsDoNotProbeVolumeDetail(t *testing.T) {
 			if got := len(transport.requests()); got != 2 {
 				t.Fatalf(
 					"AttachVolume() made %d requests, want no detail probe after the refusal",
+					got,
+				)
+			}
+		})
+	}
+}
+
+// A detach refused because the volume is still moving or still attached reconciles against the
+// volume record and waits for the detached state instead of failing as rejected input.
+func TestRefusedDetachReconcilesAnAcceptedAttachment(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		// detail is the volume record answer; it decides whether the refusal stands.
+		detail string
+	}{
+		{
+			name:   "the volume reports detaching",
+			detail: volumeDetailBody("detaching"),
+		},
+		{
+			name:   "the volume reports attaching",
+			detail: volumeDetailBody("attaching"),
+		},
+		{
+			name:   "the volume lists the attachment",
+			detail: volumeDetailBodyWithAttachment("in-use", stubServerID, stubDeviceName),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			transport := newStubTransport(
+				scriptedAnswer{body: attachmentsBody(stubDeviceName)},
+				scriptedAnswer{status: http.StatusBadRequest, body: refusedDetachBody},
+				scriptedAnswer{body: tc.detail},
+				scriptedAnswer{body: noAttachmentsBody},
+			)
+			client := newStubClient(t, stubConfig(), transport)
+
+			err := mustFinish(t, 10*time.Second, func() error {
+				return client.DetachVolume(t.Context(), stubVolumeID, stubServerID)
+			})
+			if err != nil {
+				t.Fatalf(
+					"a refused detach backed by the volume record must reconcile, got: %v",
+					err,
+				)
+			}
+
+			assertRequests(
+				t,
+				transport,
+				"GET /block_device",
+				"DELETE /detachvolume/"+stubVolumeID,
+				"GET /os-vendor-volumes/"+stubVolumeID,
+				"GET /block_device",
+			)
+		})
+	}
+}
+
+// A detach against an already-unattached volume succeeds immediately without issuing an effect call.
+func TestDetachAgainstUnattachedVolumeReturnsSuccessWithoutEffectCall(t *testing.T) {
+	t.Parallel()
+
+	transport := newStubTransport(scriptedAnswer{body: noAttachmentsBody})
+	client := newStubClient(t, stubConfig(), transport)
+
+	err := mustFinish(t, 10*time.Second, func() error {
+		return client.DetachVolume(t.Context(), stubVolumeID, stubServerID)
+	})
+	if err != nil {
+		t.Fatalf("DetachVolume() on unattached volume = %v, want nil", err)
+	}
+
+	requests := transport.requests()
+	if len(requests) != 1 {
+		t.Fatalf(
+			"DetachVolume() on unattached volume made %d requests, want exactly 1 observation request",
+			len(requests),
+		)
+	}
+	assertRequests(t, transport, "GET /block_device")
+}
+
+// A detach refusal against a volume that is not moving and not attached to the requested server
+// is reported immediately as ErrInvalidArgument without waiting.
+func TestRefusedDetachTheVolumeDeniesStaysRejected(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		detail string
+	}{
+		{
+			name:   "the volume is available and unattached",
+			detail: volumeDetailBody("available"),
+		},
+		{
+			name: "the volume is attached to another server",
+			detail: volumeDetailBodyWithAttachment(
+				"in-use",
+				"44444444-4444-4444-4444-444444444444",
+				"/dev/vdc",
+			),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			transport := newStubTransport(
+				scriptedAnswer{body: attachmentsBody(stubDeviceName)},
+				scriptedAnswer{status: http.StatusBadRequest, body: refusedDetachBody},
+				scriptedAnswer{body: tc.detail},
+			)
+			client := newStubClient(t, stubConfig(), transport)
+
+			err := mustFinish(t, 10*time.Second, func() error {
+				return client.DetachVolume(t.Context(), stubVolumeID, stubServerID)
+			})
+			if !errors.Is(err, evs.ErrInvalidArgument) {
+				t.Fatalf("DetachVolume() = %v, want %v", err, evs.ErrInvalidArgument)
+			}
+
+			assertRequests(
+				t,
+				transport,
+				"GET /block_device",
+				"DELETE /detachvolume/"+stubVolumeID,
+				"GET /os-vendor-volumes/"+stubVolumeID,
+			)
+			if requests := len(transport.requests()); requests != 3 {
+				t.Fatalf(
+					"a refusal the volume record does not back must fail fast, saw %d requests",
+					requests,
+				)
+			}
+		})
+	}
+}
+
+func TestRefusedDetachProbePreservesCallerCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	transport := newStubTransport(
+		scriptedAnswer{body: attachmentsBody(stubDeviceName)},
+		scriptedAnswer{status: http.StatusBadRequest, body: refusedDetachBody},
+		scriptedAnswer{before: cancel, err: context.Canceled},
+	)
+	client := newStubClient(t, stubConfig(), transport)
+
+	err := client.DetachVolume(ctx, stubVolumeID, stubServerID)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DetachVolume() = %v, want caller cancellation", err)
+	}
+	if errors.Is(err, evs.ErrInvalidArgument) {
+		t.Fatalf("DetachVolume() preserved the refusal over cancellation: %v", err)
+	}
+}
+
+func TestRefusedDetachReconcilePreservesCallerCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	transport := newStubTransport(
+		scriptedAnswer{body: attachmentsBody(stubDeviceName)},
+		scriptedAnswer{status: http.StatusBadRequest, body: refusedDetachBody},
+		scriptedAnswer{body: volumeDetailBody("detaching")},
+		scriptedAnswer{body: attachmentsBody(stubDeviceName), before: cancel},
+	)
+	client := newStubClient(t, stubConfig(), transport)
+
+	err := client.DetachVolume(ctx, stubVolumeID, stubServerID)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DetachVolume() = %v, want caller cancellation", err)
+	}
+	if errors.Is(err, evs.ErrInvalidArgument) {
+		t.Fatalf("DetachVolume() preserved the refusal over cancellation: %v", err)
+	}
+}
+
+func TestTerminalDetachRefusalsDoNotProbeVolumeDetail(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		status int
+		want   error
+	}{
+		{status: http.StatusUnauthorized, want: evs.ErrUnauthenticated},
+		{status: http.StatusForbidden, want: evs.ErrPermissionDenied},
+		{status: http.StatusNotFound, want: evs.ErrNotFound},
+		{status: http.StatusConflict, want: evs.ErrConflict},
+	}
+	for _, tc := range cases {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			t.Parallel()
+
+			transport := newStubTransport(
+				scriptedAnswer{body: attachmentsBody(stubDeviceName)},
+				scriptedAnswer{status: tc.status, body: `{}`},
+			)
+			client := newStubClient(t, stubConfig(), transport)
+
+			err := client.DetachVolume(t.Context(), stubVolumeID, stubServerID)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("DetachVolume() = %v, want %v", err, tc.want)
+			}
+			if got := len(transport.requests()); got != 2 {
+				t.Fatalf(
+					"DetachVolume() made %d requests, want no detail probe after the refusal",
 					got,
 				)
 			}

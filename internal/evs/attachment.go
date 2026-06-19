@@ -20,6 +20,11 @@ const attachmentPollInterval = time.Second
 // reported in seconds, not minutes.
 const refusedAttachReconcileWindow = 90 * time.Second
 
+// refusedDetachReconcileWindow bounds the wait after compute rejects a detach that the volume
+// record shows as moving. It is shorter than the operation bound so a wrong probe reading is
+// reported in seconds, not minutes.
+const refusedDetachReconcileWindow = 90 * time.Second
+
 // detachKeepVolume is the disk.Detach delete flag that leaves the volume in place. Any other
 // value would delete the volume with the attachment.
 const detachKeepVolume = 0
@@ -112,17 +117,7 @@ func (c *Client) DetachVolume(ctx context.Context, volumeID, serverID string) er
 
 	job, err := disk.Detach(c.ecs(ctx), serverID, volumeID, detachKeepVolume)
 	if err != nil {
-		kind := classifyErrorKind(err)
-		if errors.Is(kind, ErrUnavailable) || errors.Is(kind, ErrOperationFailed) {
-			_, observeErr := c.waitForAttachmentState(ctx, volumeID, serverID, detached)
-			if observeErr == nil {
-				return nil
-			}
-			if ctx.Err() != nil {
-				return c.classifyError(operation, ctx.Err())
-			}
-		}
-		return c.classifyError(operation, err)
+		return c.finishDetachAfterEffectError(ctx, operation, volumeID, serverID, err)
 	}
 	if job == nil || strings.TrimSpace(job.JobID) == "" {
 		_, err = c.waitForAttachmentState(ctx, volumeID, serverID, detached)
@@ -303,6 +298,97 @@ func (c *Client) finishAttachAfterEffectError(
 		return nil, c.classifyError(operation, ctx.Err())
 	}
 	return nil, c.classifyError(operation, attachErr)
+}
+
+// detachInFlight reads the volume record after compute refuses the detach. When the volume
+// record shows the volume is still moving (attaching or detaching) or still attached to the
+// server, detachment can be reconciled by waiting for the detached state.
+func (c *Client) detachInFlight(
+	ctx context.Context,
+	volumeID, serverID string,
+) (bool, error) {
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+
+	detail, err := v3volumes.Get(c.v3(ctx), volumeID).Extract()
+	if err != nil {
+		return false, err
+	}
+
+	if detail.Status == volumeStatusAttaching || detail.Status == volumeStatusDetaching {
+		return true, nil
+	}
+
+	for _, attachment := range detail.Attachments {
+		if attachment.ServerID == serverID {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// reconcileRefusedDetach waits, inside its own window, for the volume to become detached.
+// The window is independent of the operation bound so a wrong in-flight reading fails fast.
+func (c *Client) reconcileRefusedDetach(
+	ctx context.Context,
+	volumeID, serverID string,
+) error {
+	reconcileCtx, cancel := context.WithTimeout(ctx, refusedDetachReconcileWindow)
+	defer cancel()
+
+	_, err := c.waitForAttachmentState(reconcileCtx, volumeID, serverID, detached)
+	return err
+}
+
+// finishDetachAfterEffectError classifies a failed detach call. Transient failures and an
+// InvalidArgument backed by the volume record are reconciled; anything else is returned as the
+// original classified error.
+func (c *Client) finishDetachAfterEffectError(
+	ctx context.Context,
+	operation, volumeID, serverID string,
+	detachErr error,
+) error {
+	kind := classifyErrorKind(detachErr)
+	if errors.Is(kind, ErrUnavailable) || errors.Is(kind, ErrOperationFailed) {
+		_, observeErr := c.waitForAttachmentState(
+			ctx,
+			volumeID,
+			serverID,
+			detached,
+		)
+		if observeErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return c.classifyError(operation, ctx.Err())
+		}
+		return c.classifyError(operation, detachErr)
+	}
+	if !errors.Is(kind, ErrInvalidArgument) {
+		return c.classifyError(operation, detachErr)
+	}
+
+	moving, probeErr := c.detachInFlight(ctx, volumeID, serverID)
+	if ctx.Err() != nil {
+		return c.classifyError(operation, ctx.Err())
+	}
+	if probeErr != nil {
+		return c.classifyError(operation, detachErr)
+	}
+	if !moving {
+		return c.classifyError(operation, detachErr)
+	}
+
+	observeErr := c.reconcileRefusedDetach(ctx, volumeID, serverID)
+	if observeErr == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return c.classifyError(operation, ctx.Err())
+	}
+	return c.classifyError(operation, detachErr)
 }
 
 // waitForAttachmentJob polls job status itself because the SDK helper ignores caller

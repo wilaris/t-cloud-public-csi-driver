@@ -32,6 +32,7 @@ const (
 	volumeStatusAvailable     = "available"
 	volumeStatusAttaching     = "attaching"
 	volumeStatusInUse         = "in-use"
+	volumeStatusDetaching     = "detaching"
 	volumeStatusDeleting      = "deleting"
 	volumeStatusErrorDeleting = "error_deleting"
 )
