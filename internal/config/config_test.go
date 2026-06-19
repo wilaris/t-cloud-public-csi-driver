@@ -39,7 +39,6 @@ func TestParseSuccess(t *testing.T) {
 		"--role", "controller",
 		"--nodeid", "68e1a123-4567-89ab-cdef-0123456789ab",
 		"--endpoint", "unix:///tmp/csi.sock",
-		"--driver-name", "my-custom-driver",
 		"--availability-zone", "eu-de-01",
 	}
 
@@ -57,8 +56,8 @@ func TestParseSuccess(t *testing.T) {
 	if cfg.AvailabilityZone != "eu-de-01" {
 		t.Errorf("expected AvailabilityZone %q, got %q", "eu-de-01", cfg.AvailabilityZone)
 	}
-	if cfg.DriverName != "my-custom-driver" {
-		t.Errorf("expected DriverName %q, got %q", "my-custom-driver", cfg.DriverName)
+	if cfg.DriverName != config.DefaultDriverName {
+		t.Errorf("expected DriverName %q, got %q", config.DefaultDriverName, cfg.DriverName)
 	}
 	if cfg.Version != config.DriverVersion {
 		t.Errorf("expected Version %q, got %q", config.DriverVersion, cfg.Version)
@@ -525,5 +524,100 @@ func TestVersionFlagNeedsNoRole(t *testing.T) {
 
 	if !errors.Is(parseErr, config.ErrVersionRequested) {
 		t.Fatalf("expected a version request without a role to be answered, got: %v", parseErr)
+	}
+}
+
+func TestDriverNameFlagRefusedAsUnknown(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		flag string
+	}{
+		{name: "double dash separated", flag: "--driver-name"},
+		{name: "single dash separated", flag: "-driver-name"},
+		{name: "double dash assigned", flag: "--driver-name=custom.driver.name"},
+		{name: "single dash assigned", flag: "-driver-name=custom.driver.name"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			for _, role := range []string{"controller", "node"} {
+				args := []string{"--role", role, "--nodeid", "node-uuid-123", tc.flag}
+				if !strings.Contains(tc.flag, "=") {
+					args = append(args, "custom.driver.name")
+				}
+
+				_, err := config.Parse(args, mockGetenv(validEnvMap()))
+				if err == nil {
+					t.Fatalf("config.Parse(%v) succeeded, want unknown flag error", args)
+				}
+				if !strings.Contains(err.Error(), "driver-name") {
+					t.Errorf(
+						"config.Parse(%v) error = %v, want error naming driver-name",
+						args,
+						err,
+					)
+				}
+			}
+		})
+	}
+}
+
+func TestDriverNameImmutableFromEnvironment(t *testing.T) {
+	t.Parallel()
+
+	env := validEnvMap()
+	env["CSI_DRIVER_NAME"] = "overridden.csi.driver"
+	env["DRIVER_NAME"] = "overridden.csi.driver"
+	env["OS_DRIVER_NAME"] = "overridden.csi.driver"
+
+	args := []string{"--role", "controller", "--nodeid", "node-uuid-123"}
+
+	cfg, err := config.Parse(args, mockGetenv(env))
+	if err != nil {
+		t.Fatalf("config.Parse(%v) error = %v, want clean parse", args, err)
+	}
+
+	if cfg.DriverName != config.DefaultDriverName {
+		t.Errorf("cfg.DriverName = %q, want %q", cfg.DriverName, config.DefaultDriverName)
+	}
+}
+
+func TestDefaultEndpointContainsDefaultDriverName(t *testing.T) {
+	t.Parallel()
+
+	if !strings.Contains(config.DefaultEndpoint, config.DefaultDriverName) {
+		t.Errorf(
+			"DefaultEndpoint %q does not contain DefaultDriverName %q",
+			config.DefaultEndpoint,
+			config.DefaultDriverName,
+		)
+	}
+
+	wantPrefix := "unix:///var/lib/kubelet/plugins/" + config.DefaultDriverName + "/"
+	if !strings.HasPrefix(config.DefaultEndpoint, wantPrefix) {
+		t.Errorf("DefaultEndpoint %q does not have prefix %q", config.DefaultEndpoint, wantPrefix)
+	}
+}
+
+func TestValidateRequiresNonEmptyDriverName(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		Role:       config.RoleNode,
+		Endpoint:   config.DefaultEndpoint,
+		DriverName: "",
+		Version:    config.DriverVersion,
+	}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() succeeded with empty DriverName, want error")
+	}
+	if !strings.Contains(err.Error(), "driver name cannot be empty") {
+		t.Errorf("Validate() error = %v, want error mentioning driver name cannot be empty", err)
 	}
 }

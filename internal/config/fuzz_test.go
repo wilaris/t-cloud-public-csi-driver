@@ -91,13 +91,13 @@ func FuzzResolveEndpoint(f *testing.F) {
 }
 
 func FuzzParseFlags(f *testing.F) {
-	f.Add("controller", "unix:///tmp/csi.sock", "node-1", "custom-driver", "eu-de-01", "")
-	f.Add("node", "unix:///tmp/csi.sock", "node-2", "evs.csi.t-cloud.wilaris.dev", "eu-de-02", "")
-	f.Add("node", "tcp://127.0.0.1:9000", "", "evs.csi.t-cloud.wilaris.dev", "", "")
-	f.Add("invalid-role", "", "", "", "", "--unknown")
-	f.Add("", "unix:///tmp/csi.sock", "", "", "", "--version")
-	f.Add("controller", "unix:///var/lib/../csi.sock", "", "", "", "--help")
-	f.Add("controller", "http://invalid", "id", "driver", "zone", "")
+	f.Add("controller", "unix:///tmp/csi.sock", "node-1", "eu-de-01", "")
+	f.Add("node", "unix:///tmp/csi.sock", "node-2", "eu-de-02", "")
+	f.Add("node", "tcp://127.0.0.1:9000", "", "", "")
+	f.Add("invalid-role", "", "", "", "--unknown")
+	f.Add("", "unix:///tmp/csi.sock", "", "", "--version")
+	f.Add("controller", "unix:///var/lib/../csi.sock", "", "", "--help")
+	f.Add("controller", "http://invalid", "id", "zone", "")
 
 	validEnv := map[string]string{
 		EnvAuthURL:       "https://iam.eu-de.otc.t-systems.com/v3",
@@ -112,7 +112,7 @@ func FuzzParseFlags(f *testing.F) {
 		return validEnv[key]
 	}
 
-	f.Fuzz(func(t *testing.T, role, endpoint, nodeID, driverName, az, extraArg string) {
+	f.Fuzz(func(t *testing.T, role, endpoint, nodeID, az, extraArg string) {
 		args := []string{}
 		if role != "" {
 			args = append(args, "--role", role)
@@ -122,9 +122,6 @@ func FuzzParseFlags(f *testing.F) {
 		}
 		if nodeID != "" {
 			args = append(args, "--nodeid", nodeID)
-		}
-		if driverName != "" {
-			args = append(args, "--driver-name", driverName)
 		}
 		if az != "" {
 			args = append(args, "--availability-zone", az)
@@ -156,8 +153,8 @@ func FuzzParseFlags(f *testing.F) {
 		if cfg.Endpoint == "" {
 			t.Fatal("parsed config endpoint must not be empty")
 		}
-		if cfg.DriverName == "" {
-			t.Fatal("parsed config driver-name must not be empty")
+		if cfg.DriverName != DefaultDriverName {
+			t.Fatalf("parsed config DriverName = %q, want %q", cfg.DriverName, DefaultDriverName)
 		}
 		if cfg.Version == "" {
 			t.Fatal("parsed config version must not be empty")

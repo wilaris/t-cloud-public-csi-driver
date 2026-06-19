@@ -144,7 +144,6 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 		role             string
 		endpoint         string
 		nodeID           string
-		driverName       string
 		showVersion      bool
 		availabilityZone string
 	)
@@ -167,7 +166,6 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 		"",
 		"T Cloud Public compute instance Server UUID; overrides the metadata value on the node role",
 	)
-	fs.StringVar(&driverName, "driver-name", DefaultDriverName, "CSI driver name")
 	fs.BoolVar(&showVersion, "version", false, "print the build identity and exit")
 	fs.StringVar(
 		&availabilityZone,
@@ -198,7 +196,7 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 		Role:             parsedRole,
 		Endpoint:         strings.TrimSpace(endpoint),
 		NodeID:           strings.TrimSpace(nodeID),
-		DriverName:       strings.TrimSpace(driverName),
+		DriverName:       DefaultDriverName,
 		Version:          DriverVersion,
 		AvailabilityZone: strings.TrimSpace(availabilityZone),
 	}
@@ -257,7 +255,7 @@ func (c *Config) Validate() error {
 	}
 
 	if c.DriverName == "" {
-		return fmt.Errorf("invalid configuration: driver-name cannot be empty")
+		return fmt.Errorf("invalid configuration: driver name cannot be empty")
 	}
 
 	if c.Version == "" {

@@ -179,6 +179,24 @@ func TestRunRefusesAMissingOrUnknownRole(t *testing.T) {
 	}
 }
 
+func TestRunRefusesDriverNameFlag(t *testing.T) {
+	// Not parallel: mutates process arguments and environment.
+	setCloudEnv(t, refusedAuthURL(t))
+	endpoint, socketPath := testSocketEndpoint(t)
+	setArgs(t, "--role", "node", "--endpoint", endpoint, "--driver-name", "custom.driver.name")
+
+	err := run(discardLogger())
+	if err == nil {
+		t.Fatal("expected startup to fail when --driver-name is provided")
+	}
+	if !strings.Contains(err.Error(), "driver-name") {
+		t.Errorf("expected error to name unknown flag driver-name, got: %v", err)
+	}
+	if _, statErr := os.Stat(socketPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("a refused flag left a listener socket at %s", socketPath)
+	}
+}
+
 func TestRunControllerDependencyFailureLeavesNoSocket(t *testing.T) {
 	// Not parallel: mutates process arguments and environment.
 	setCloudEnv(t, refusedAuthURL(t))
