@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
@@ -27,6 +28,10 @@ import (
 
 // socketDirPerm is the permission mode for a created endpoint socket directory.
 const socketDirPerm = 0o750
+
+// gracefulStopTimeout bounds how long graceful shutdown waits for in-flight RPCs
+// before escalating to an immediate hard stop.
+const gracefulStopTimeout = 15 * time.Second
 
 func main() {
 	logger := log.NewLoggerFromEnv(os.Stdout)
@@ -201,8 +206,9 @@ func clearStaleSocket(socketPath string) error {
 	return nil
 }
 
-// serve runs the gRPC server until it fails or the process is signaled, then
-// GracefulStop so in-flight RPCs can finish.
+// serve runs the gRPC server until it fails or the process context is cancelled.
+// On shutdown, it initiates GracefulStop to let in-flight RPCs finish, bounded by
+// gracefulStopTimeout and escalating immediately to Stop on a second signal.
 func serve(ctx context.Context, server *grpc.Server, listener net.Listener) error {
 	served := make(chan error, 1)
 	go func() {
@@ -216,7 +222,28 @@ func serve(ctx context.Context, server *grpc.Server, listener net.Listener) erro
 		}
 		return nil
 	case <-ctx.Done():
-		server.GracefulStop()
-		return nil
+		stopc := make(chan struct{})
+		go func() {
+			server.GracefulStop()
+			close(stopc)
+		}()
+
+		sigc := make(chan os.Signal, 1)
+		signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sigc)
+
+		timer := time.NewTimer(gracefulStopTimeout)
+		defer timer.Stop()
+
+		select {
+		case <-stopc:
+			return nil
+		case <-sigc:
+			server.Stop()
+			return nil
+		case <-timer.C:
+			server.Stop()
+			return nil
+		}
 	}
 }

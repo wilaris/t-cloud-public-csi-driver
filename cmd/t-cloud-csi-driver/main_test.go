@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -470,10 +471,17 @@ type blockingIdentity struct {
 	release chan struct{}
 }
 
-func (s *blockingIdentity) Probe(context.Context, *csi.ProbeRequest) (*csi.ProbeResponse, error) {
+func (s *blockingIdentity) Probe(
+	ctx context.Context,
+	_ *csi.ProbeRequest,
+) (*csi.ProbeResponse, error) {
 	close(s.entered)
-	<-s.release
-	return &csi.ProbeResponse{}, nil
+	select {
+	case <-s.release:
+		return &csi.ProbeResponse{}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func TestServeStopsGracefullyAndLetsAnInFlightCallFinish(t *testing.T) {
@@ -529,5 +537,163 @@ func TestServeStopsGracefullyAndLetsAnInFlightCallFinish(t *testing.T) {
 	}
 	if err := <-served; err != nil {
 		t.Fatalf("expected a stopped server to report no failure, got: %v", err)
+	}
+}
+
+func TestServeGracefulStopTimeoutHardStopsNeverReturningCall(t *testing.T) {
+	listener := bufconn.Listen(bufSize)
+	server := grpc.NewServer()
+	svc := &blockingIdentity{entered: make(chan struct{}), release: make(chan struct{})}
+	csi.RegisterIdentityServer(server, svc)
+	t.Cleanup(func() {
+		select {
+		case <-svc.release:
+		default:
+			close(svc.release)
+		}
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- serve(ctx, server, listener) }()
+
+	conn, err := grpc.NewClient(
+		"passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial bufnet: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	probed := make(chan error, 1)
+	go func() {
+		// Use a detached background context so caller-side timeout doesn't precede server hard stop.
+		_, probeErr := csi.NewIdentityClient(conn).Probe(context.Background(), &csi.ProbeRequest{})
+		probed <- probeErr
+	}()
+
+	select {
+	case <-svc.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight call never reached the handler")
+	}
+
+	cancel()
+	start := time.Now()
+
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("expected stopped server to report no failure, got: %v", err)
+		}
+	case <-time.After(35 * time.Second):
+		t.Fatal("serve did not terminate within gracefulStopTimeout bound")
+	}
+
+	elapsed := time.Since(start)
+	if elapsed < 14*time.Second {
+		t.Errorf("serve terminated in %v, expected bound near %v", elapsed, gracefulStopTimeout)
+	}
+
+	select {
+	case err := <-probed:
+		if err == nil {
+			t.Fatal(
+				"expected in-flight call to fail when hard stop terminated server, got nil error",
+			)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight client call did not unblock after server hard stop")
+	}
+}
+
+func TestServeSecondSignalForcesImmediateHardStop(t *testing.T) {
+	// Not parallel: delivers process-level signals via os.Getpid().
+	// SIGTERM is delivered so Go's testing runner (which traps SIGINT for test abort) is not cancelled.
+	shield := make(chan os.Signal, 10)
+	signal.Notify(shield, syscall.SIGTERM)
+	t.Cleanup(func() { signal.Stop(shield) })
+
+	listener := bufconn.Listen(bufSize)
+	server := grpc.NewServer()
+	svc := &blockingIdentity{entered: make(chan struct{}), release: make(chan struct{})}
+	csi.RegisterIdentityServer(server, svc)
+	t.Cleanup(func() {
+		select {
+		case <-svc.release:
+		default:
+			close(svc.release)
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- serve(ctx, server, listener) }()
+
+	conn, err := grpc.NewClient(
+		"passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial bufnet: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	probed := make(chan error, 1)
+	go func() {
+		_, probeErr := csi.NewIdentityClient(conn).Probe(
+			context.Background(),
+			&csi.ProbeRequest{},
+		)
+		probed <- probeErr
+	}()
+
+	select {
+	case <-svc.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight call never reached the handler")
+	}
+
+	// Initiate graceful shutdown.
+	cancel()
+
+	// Allow serve goroutine to enter graceful drain and register its signal listener.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("failed to deliver signal: %v", err)
+	}
+
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("expected stopped server to report no failure, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not terminate immediately on second signal")
+	}
+
+	elapsed := time.Since(start)
+	if elapsed > 3*time.Second {
+		t.Errorf("second signal took %v to terminate server, want < 3s", elapsed)
+	}
+
+	select {
+	case err := <-probed:
+		if err == nil {
+			t.Fatal("expected in-flight call to fail on forced hard stop, got nil error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight client call did not unblock after forced hard stop")
 	}
 }
